@@ -36,7 +36,8 @@ tmp/
 .pytest_cache/
 .ipynb_checkpoints/
 WTConv-main/
-S3R/Data/
+S3R/
+swav/test*
 
 # env
 .env
