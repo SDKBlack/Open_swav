@@ -137,7 +137,7 @@ parser.add_argument("--boundary_pos_thresh", type=float, default=0.5, help="thre
 parser.add_argument("--boundary_neg_thresh", type=float, default=1.0, help="threshold for negative class distance")
 parser.add_argument("--boundary_proto_thresh", type=float, default=1.0, help="threshold for inter-prototype distance")
 parser.add_argument("--boundary_loss_weight", type=float, default=0.1, help="weight for boundary loss")
-parser.add_argument("--random_erasing_prob", type=float, default=0.2, help="probability of random erasing")
+parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
 
 
 def main():

@@ -62,10 +62,28 @@ class MultiPrototypes(nn.Module):
             out.append(getattr(self, "prototypes" + str(i))(x))
         return out
 
+class CosineClassifier(nn.Module):
+    def __init__(self, in_features, num_classes, scale=20.0):
+        super(CosineClassifier, self).__init__()
+        self.in_features = in_features
+        self.num_classes = num_classes
+        self.weight = nn.Parameter(torch.Tensor(num_classes, in_features))
+        self.scale = scale
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.weight, std=0.01)
+
+    def forward(self, x):
+        x_norm = F.normalize(x, p=2, dim=1)
+        w_norm = F.normalize(self.weight, p=2, dim=1)
+        return self.scale * F.linear(x_norm, w_norm)
+
+
 class WTNet(nn.Module):
     def __init__(self, in_channels=3, input_size=[512, 512], semantic_dim=128, num_classes=0, 
                  output_dim=0, hidden_mlp=0, nmb_prototypes=0, eval_mode=False, normalize=False,
-                 use_attention=True, attn_heads=8, use_shared_stem=True, shared_stem_blocks=2):
+                 use_attention=True, attn_heads=8, use_shared_stem=False, shared_stem_blocks=2):
         super(WTNet, self).__init__()
         
         # SwAV specific params
@@ -137,7 +155,7 @@ class WTNet(nn.Module):
             
         # Classifier (optional)
         if num_classes > 0:
-            self.classifier = nn.Linear(self.semantic_dim, num_classes)
+            self.classifier = CosineClassifier(self.semantic_dim, num_classes)
         else:
             self.classifier = None
 
@@ -187,7 +205,7 @@ class WTNet(nn.Module):
     def _make_block(self, in_c, out_c, k, pool=True):
         layers = []
         # WTConv2d(in, in) -> Conv2d(in, out, 1)
-        layers.append(WTConv2d(in_c, in_c, kernel_size=k, wt_levels=1))
+        layers.append(WTConv2d(in_c, in_c, kernel_size=k, wt_levels=2))
         if in_c != out_c:
             layers.append(nn.Conv2d(in_c, out_c, kernel_size=1))
             
