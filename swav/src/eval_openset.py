@@ -161,34 +161,64 @@ def plot_tsne(test_X, test_Y, num_known, dump_path):
             "tsne_unknown.png"
         )
 
-    # 3. Both
+    # 3. Both: plot known and unknown together.
+    # Known classes use a discrete colormap (tab20). Unknown classes are plotted
+    # like known classes (filled circles) but use a separate colormap and a black
+    # edge so they remain distinguishable when overlapping with known points.
     plt.figure(figsize=(12, 10))
+
     # Plot knowns
     if known_mask.sum() > 0:
-        scatter = plt.scatter(
-            X_embedded[known_mask, 0], 
-            X_embedded[known_mask, 1], 
-            c=test_Y_np[known_mask], 
-            cmap='tab20', 
-            s=20, 
-            alpha=0.7,
-            label='Known'
+        scatter_known = plt.scatter(
+            X_embedded[known_mask, 0],
+            X_embedded[known_mask, 1],
+            c=test_Y_np[known_mask],
+            cmap='tab20',
+            s=20,
+            alpha=0.8,
+            label='Known',
+            linewidths=0
         )
         # Add a colorbar for known classes
-        plt.colorbar(scatter, label='Known Class ID')
-        
-    # Plot unknowns
+        plt.colorbar(scatter_known, label='Known Class ID')
+
+    # Plot unknowns: map unknown class ids to a dense 0..K-1 range so we can use
+    # a separate colormap. We use a distinct colormap (try 'tab20b' then fallback)
+    # and draw a thin black edge around markers to help visual separation on overlap.
     if unknown_mask.sum() > 0:
-        plt.scatter(
-            X_embedded[unknown_mask, 0], 
-            X_embedded[unknown_mask, 1], 
-            c='black', 
-            s=30, 
-            marker='x',
-            alpha=0.5,
+        unknown_labels = test_Y_np[unknown_mask]
+        unique_unknowns, unknown_inverse = np.unique(unknown_labels, return_inverse=True)
+        n_unknown = len(unique_unknowns)
+
+        # Choose a distinct colormap for unknowns; fall back to Dark2 if tab20b not available
+        try:
+            unknown_cmap = plt.get_cmap('tab20b')
+        except Exception:
+            unknown_cmap = plt.get_cmap('Dark2')
+
+        scatter_unknown = plt.scatter(
+            X_embedded[unknown_mask, 0],
+            X_embedded[unknown_mask, 1],
+            c=unknown_inverse,
+            cmap=unknown_cmap,
+            s=36,
+            alpha=0.95,
+            edgecolors='k',
+            linewidths=0.25,
             label='Unknown'
         )
-    
+
+        # Create a colorbar for unknowns and label ticks with the original class ids
+        cbar_unk = plt.colorbar(scatter_unknown, label='Unknown Class ID (original)')
+        if n_unknown <= 30:
+            ticks = np.arange(n_unknown)
+            cbar_unk.set_ticks(ticks)
+            cbar_unk.set_ticklabels([str(int(x)) for x in unique_unknowns])
+        else:
+            # Too many unknowns: show only endpoints
+            cbar_unk.set_ticks([0, n_unknown - 1])
+            cbar_unk.set_ticklabels([str(int(unique_unknowns[0])), str(int(unique_unknowns[-1]))])
+
     plt.title("t-SNE: Known vs Unknown", fontsize=16)
     plt.legend(fontsize=12)
     plt.axis('off')
