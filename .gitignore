@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+
+# IDE
+.vscode/
+.idea/
+
+# data / datasets / large files (不要把数据和大 checkpoint 推上 github)
+Data/
+dump*/
+test_*/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.tar
+*.tar.gz
+*.zip
+*.tfrecord
+*.lmdb
+*.ckp
+*.ckpt
+# large folders created by runs / autoDL
+.autodl/
+logs/
+tmp/
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+WTConv-main/
+S3R/Data/
+
+# env
+.env
+.venv/
+dist/
+build/
