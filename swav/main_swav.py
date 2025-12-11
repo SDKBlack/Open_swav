@@ -137,6 +137,7 @@ parser.add_argument("--boundary_pos_thresh", type=float, default=0.5, help="thre
 parser.add_argument("--boundary_neg_thresh", type=float, default=1.0, help="threshold for negative class distance")
 parser.add_argument("--boundary_proto_thresh", type=float, default=1.0, help="threshold for inter-prototype distance")
 parser.add_argument("--boundary_loss_weight", type=float, default=0.1, help="weight for boundary loss")
+parser.add_argument("--boundary_warmup_epochs", type=int, default=10, help="number of epochs to wait before enabling boundary loss")
 parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
 
 
@@ -496,7 +497,9 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             
         # ============ Boundary Loss ... ============
         boundary_loss = 0
-        if boundary_criterion is not None and labels is not None:
+        # Only compute boundary loss after the warmup/wait period to avoid
+        # destabilizing early training. Controlled by --boundary_warmup_epochs.
+        if boundary_criterion is not None and labels is not None and epoch >= args.boundary_warmup_epochs:
             # Get backbone features
             # model is DDP wrapped, so use model.module
             backbone_feats = getattr(model.module, '_last_backbone', None)
