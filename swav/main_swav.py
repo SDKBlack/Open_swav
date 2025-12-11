@@ -138,6 +138,8 @@ parser.add_argument("--boundary_neg_thresh", type=float, default=1.0, help="thre
 parser.add_argument("--boundary_proto_thresh", type=float, default=1.0, help="threshold for inter-prototype distance")
 parser.add_argument("--boundary_loss_weight", type=float, default=0.1, help="weight for boundary loss")
 parser.add_argument("--boundary_warmup_epochs", type=int, default=10, help="number of epochs to wait before enabling boundary loss")
+parser.add_argument("--boundary_pos_start", type=float, default=None, help="starting positive threshold for boundary loss (will anneal to boundary_pos_thresh)")
+parser.add_argument("--boundary_pos_anneal_epochs", type=int, default=0, help="number of epochs over which to linearly anneal boundary_pos from start to target (0 disables annealing)")
 parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
 
 
@@ -147,6 +149,11 @@ def main():
     init_distributed_mode(args)
     fix_random_seeds(args.seed)
     logger, training_stats = initialize_exp(args, "epoch", "loss")
+
+    # If no explicit start is provided, start from the configured target so nothing changes
+    # unless the user explicitly sets a different starting threshold.
+    if getattr(args, "boundary_pos_start", None) is None:
+        args.boundary_pos_start = args.boundary_pos_thresh
 
     # build data
     if args.split_path:
@@ -497,6 +504,24 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             
         # ============ Boundary Loss ... ============
         boundary_loss = 0
+        # Compute current positive threshold (possibly annealed). If annealing is
+        # disabled (boundary_pos_anneal_epochs == 0), this will simply be
+        # args.boundary_pos_thresh. We update the criterion's pos_thresh so the
+        # loss uses the current value.
+        if boundary_criterion is not None:
+            if args.boundary_pos_anneal_epochs > 0:
+                t = min(epoch, args.boundary_pos_anneal_epochs)
+                frac = float(t) / float(args.boundary_pos_anneal_epochs)
+                current_pos = args.boundary_pos_start + frac * (args.boundary_pos_thresh - args.boundary_pos_start)
+            else:
+                current_pos = args.boundary_pos_thresh
+            # write current value into the criterion (this is an attribute used in forward)
+            try:
+                boundary_criterion.pos_thresh = float(current_pos)
+            except Exception:
+                # if criterion doesn't expose the attribute for some reason, ignore
+                pass
+
         # Only compute boundary loss after the warmup/wait period to avoid
         # destabilizing early training. Controlled by --boundary_warmup_epochs.
         if boundary_criterion is not None and labels is not None and epoch >= args.boundary_warmup_epochs:
