@@ -130,7 +130,7 @@ class WTNet(nn.Module):
             nn.ReLU(),
             nn.Linear(self.semantic_dim*2, self.semantic_dim),
             nn.BatchNorm1d(self.semantic_dim),
-            nn.ReLU()
+            # nn.ReLU()
         )
         
         # SwAV Projection Head
