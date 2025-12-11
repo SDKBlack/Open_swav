@@ -4,50 +4,58 @@ import torch.nn.functional as F
 from .wtconv.wtconv2d import WTConv2d
 
 
-class MHSA2D(nn.Module):
-    """A simple multi-head self-attention for 2D feature maps.
-    Input: (B, C, H, W)
-    Output: (B, C, H, W) with residual connection.
-    """
-    def __init__(self, in_channels, num_heads=8, dropout=0.0):
-        super(MHSA2D, self).__init__()
-        assert in_channels % num_heads == 0, "in_channels must be divisible by num_heads"
-        self.in_channels = in_channels
-        self.num_heads = num_heads
-        self.head_dim = in_channels // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        # use 1x1 convs to compute qkv and projection
-        self.qkv = nn.Conv2d(in_channels, in_channels * 3, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        # residual scaling
-        self.gamma = nn.Parameter(torch.tensor(0.0))
+class GeM(nn.Module):
+    def __init__(self, p=3, eps=1e-6):
+        super(GeM, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        N = H * W
-        qkv = self.qkv(x)  # (B, 3C, H, W)
-        qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, N)
-        # qkv[:, i] -> (B, heads, head_dim, N)
-        q = qkv[:, 0]  # (B, heads, head_dim, N)
-        k = qkv[:, 1]
-        v = qkv[:, 2]
-        # transpose to (B, heads, N, head_dim)
-        q = q.permute(0, 1, 3, 2).contiguous()
-        k = k.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2).contiguous()
+        return self.gem(x, p=self.p, eps=self.eps)
 
-        # compute attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, heads, N, N)
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+    def gem(self, x, p=3, eps=1e-6):
+        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1. / p)
 
-        out = torch.matmul(attn, v)  # (B, heads, N, head_dim)
-        out = out.permute(0, 1, 3, 2).contiguous().reshape(B, C, H, W)
-        out = self.proj(out)
-        return x + self.gamma * out
+    def __repr__(self):
+        return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
+
+
+class CoordinateAttention(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordinateAttention, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+        
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        
+        n,c,h,w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y) 
+        
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_h * a_w
+
+        return out
 
 class MultiPrototypes(nn.Module):
     def __init__(self, output_dim, nmb_prototypes):
@@ -62,22 +70,38 @@ class MultiPrototypes(nn.Module):
             out.append(getattr(self, "prototypes" + str(i))(x))
         return out
 
-class CosineClassifier(nn.Module):
-    def __init__(self, in_features, num_classes, scale=20.0):
-        super(CosineClassifier, self).__init__()
+class ArcFaceClassifier(nn.Module):
+    def __init__(self, in_features, num_classes, s=30.0, m=0.50):
+        super(ArcFaceClassifier, self).__init__()
         self.in_features = in_features
         self.num_classes = num_classes
-        self.weight = nn.Parameter(torch.Tensor(num_classes, in_features))
-        self.scale = scale
-        self.reset_parameters()
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(num_classes, in_features))
+        nn.init.xavier_uniform_(self.weight)
 
-    def reset_parameters(self):
-        nn.init.normal_(self.weight, std=0.01)
-
-    def forward(self, x):
-        x_norm = F.normalize(x, p=2, dim=1)
-        w_norm = F.normalize(self.weight, p=2, dim=1)
-        return self.scale * F.linear(x_norm, w_norm)
+    def forward(self, input, label=None):
+        # normalize features
+        x = F.normalize(input, dim=1)
+        # normalize weights
+        W = F.normalize(self.weight, dim=1)
+        # dot product
+        cosine = F.linear(x, W)
+        
+        if label is None:
+            return cosine * self.s
+            
+        # ArcFace
+        # cos(theta + m)
+        theta = torch.acos(torch.clamp(cosine, -1.0 + 1e-7, 1.0 - 1e-7))
+        target_logits = torch.cos(theta + self.m)
+        
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        output = cosine * (1.0 - one_hot) + target_logits * one_hot
+        output *= self.s
+        return output
 
 
 class WTNet(nn.Module):
@@ -120,9 +144,13 @@ class WTNet(nn.Module):
         self.feature_dim = 128 * 3
         # Attention module (applied on concatenated feature map before pooling)
         if self.use_attention:
-            self.attn = MHSA2D(self.feature_dim, num_heads=self.attn_heads)
+            # self.attn = MHSA2D(self.feature_dim, num_heads=self.attn_heads)
+            self.attn = CoordinateAttention(self.feature_dim, self.feature_dim)
         else:
             self.attn = None
+        
+        # GeM Pooling
+        self.gem = GeM()
         
         self.encoder_to_semantic = nn.Sequential(
             nn.Linear(self.feature_dim, self.semantic_dim*2),
@@ -155,7 +183,8 @@ class WTNet(nn.Module):
             
         # Classifier (optional)
         if num_classes > 0:
-            self.classifier = CosineClassifier(self.semantic_dim, num_classes)
+            # self.classifier = CosineClassifier(self.semantic_dim, num_classes)
+            self.classifier = ArcFaceClassifier(self.semantic_dim, num_classes)
         else:
             self.classifier = None
 
@@ -235,7 +264,8 @@ class WTNet(nn.Module):
             out = self.attn(out)
 
         # Global Pooling
-        out = F.adaptive_avg_pool2d(out, (1, 1))
+        # out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = self.gem(out)
         out = out.view(out.size(0), -1)
 
         # Encoder to Semantic
@@ -254,7 +284,7 @@ class WTNet(nn.Module):
             return x, self.prototypes(x)
         return x
 
-    def forward(self, inputs):
+    def forward(self, inputs, labels=None):
         if not isinstance(inputs, list):
             inputs = [inputs]
         idx_crops = torch.cumsum(torch.unique_consecutive(
@@ -272,7 +302,35 @@ class WTNet(nn.Module):
         
         logits = None
         if self.classifier is not None:
-            logits = self.classifier(output)
+            # If labels are provided, we need to expand them to match the output size
+            # output size is sum(n_crops * bs)
+            # labels size is bs
+            # We assume labels correspond to the first bs samples (and repeated for other crops)
+            # Actually, inputs is a list of crops. Each crop has batch_size samples.
+            # The labels are for the images.
+            # So if we have N crops, we have N * bs samples.
+            # The labels should be repeated N times.
+            
+            if labels is not None:
+                bs = labels.size(0)
+                total_bs = output.size(0)
+                if total_bs > bs:
+                    # Repeat labels
+                    n_repeats = total_bs // bs
+                    # Check if exact multiple
+                    if total_bs % bs == 0:
+                        labels_expanded = labels.repeat(n_repeats)
+                        logits = self.classifier(output, labels_expanded)
+                    else:
+                        # Fallback or error? 
+                        # If batch sizes differ across crops (unlikely in SwAV), we might have issues.
+                        # For now, assume standard SwAV setup.
+                        # If not matching, pass None to get cosine similarity without margin
+                        logits = self.classifier(output)
+                else:
+                    logits = self.classifier(output, labels)
+            else:
+                logits = self.classifier(output)
             
         embedding, proto_out = self.forward_head(output)
         

@@ -137,7 +137,7 @@ parser.add_argument("--boundary_pos_thresh", type=float, default=0.5, help="thre
 parser.add_argument("--boundary_neg_thresh", type=float, default=1.0, help="threshold for negative class distance")
 parser.add_argument("--boundary_proto_thresh", type=float, default=1.0, help="threshold for inter-prototype distance")
 parser.add_argument("--boundary_loss_weight", type=float, default=0.1, help="weight for boundary loss")
-parser.add_argument("--boundary_warmup_epochs", type=int, default=10, help="number of epochs to wait before enabling boundary loss")
+parser.add_argument("--boundary_warmup_epochs", type=int, default=0, help="number of epochs to wait before enabling boundary loss")
 parser.add_argument("--boundary_pos_start", type=float, default=None, help="starting positive threshold for boundary loss (will anneal to boundary_pos_thresh)")
 parser.add_argument("--boundary_pos_anneal_epochs", type=int, default=0, help="number of epochs over which to linearly anneal boundary_pos from start to target (0 disables annealing)")
 parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
@@ -448,14 +448,14 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         # ============ multi-res forward passes ... ============
         if args.use_fp16:
             with torch.cuda.amp.autocast():
-                ret = model(inputs)
+                ret = model(inputs, labels)
                 if len(ret) == 3:
                     embedding, output, logits = ret
                 else:
                     embedding, output = ret
                     logits = None
         else:
-            ret = model(inputs)
+            ret = model(inputs, labels)
             if len(ret) == 3:
                 embedding, output, logits = ret
             else:
@@ -534,7 +534,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 # labels is [B]
                 # We need to expand labels to match backbone_feats
                 n_crops = backbone_feats.size(0) // bs
-                labels_expanded = labels.repeat_interleave(n_crops)
+                labels_expanded = labels.repeat(n_crops)
                 
                 boundary_loss = boundary_criterion(backbone_feats, labels_expanded)
                 boundary_losses.update(boundary_loss.item(), bs)
