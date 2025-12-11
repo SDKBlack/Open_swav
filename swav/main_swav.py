@@ -141,6 +141,7 @@ parser.add_argument("--boundary_warmup_epochs", type=int, default=0, help="numbe
 parser.add_argument("--boundary_pos_start", type=float, default=None, help="starting positive threshold for boundary loss (will anneal to boundary_pos_thresh)")
 parser.add_argument("--boundary_pos_anneal_epochs", type=int, default=0, help="number of epochs over which to linearly anneal boundary_pos from start to target (0 disables annealing)")
 parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
+parser.add_argument("--tb_log_interval", type=int, default=50, help="TensorBoard logging interval in iterations (only on rank 0)")
 
 
 def main():
@@ -565,7 +566,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         losses.update(total_loss.item(), inputs[0].size(0))
         batch_time.update(time.time() - end)
         end = time.time()
-        if args.rank ==0 and it % 50 == 0:
+        if args.rank == 0 and it % args.tb_log_interval == 0:
             logger.info(
                 "Epoch: [{0}][{1}]\t"
                 "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
@@ -584,6 +585,65 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                     lr=optimizer.optimizer.param_groups[0]["lr"],
                 )
             )
+
+            # TensorBoard logging (per-iteration)
+            try:
+                tb = getattr(logger, 'tb_writer', None)
+                if tb is not None:
+                    # global step: iteration
+                    global_step = iteration
+                    # total loss
+                    tb.add_scalar('train/total_loss_iter', float(total_loss.item()), global_step)
+                    # swav loss (per-crop loss variable `loss`)
+                    try:
+                        tb.add_scalar('train/swav_loss_iter', float(loss.item()), global_step)
+                    except Exception:
+                        tb.add_scalar('train/swav_loss_iter', float(loss), global_step)
+                    # ce loss
+                    try:
+                        tb.add_scalar('train/ce_loss_iter', float(ce_loss.item()), global_step)
+                    except Exception:
+                        tb.add_scalar('train/ce_loss_iter', float(ce_loss), global_step)
+                    # boundary loss
+                    try:
+                        tb.add_scalar('train/boundary_loss_iter', float(boundary_loss.item()), global_step)
+                    except Exception:
+                        tb.add_scalar('train/boundary_loss_iter', float(boundary_loss), global_step)
+                    # learning rate
+                    try:
+                        current_lr = None
+                        try:
+                            current_lr = optimizer.param_groups[0]["lr"]
+                        except Exception:
+                            try:
+                                current_lr = optimizer.optimizer.param_groups[0]["lr"]
+                            except Exception:
+                                current_lr = lr_schedule[iteration]
+                        tb.add_scalar('train/lr', float(current_lr), global_step)
+                    except Exception:
+                        pass
+            except Exception:
+                # avoid breaking training if tensorboard write fails
+                pass
+    # Epoch-level TensorBoard logging (averages)
+    try:
+        tb = getattr(logger, 'tb_writer', None)
+        if tb is not None and args.rank == 0:
+            tb.add_scalar('train/total_loss_epoch', float(losses.avg), epoch)
+            tb.add_scalar('train/ce_loss_epoch', float(ce_losses.avg), epoch)
+            tb.add_scalar('train/boundary_loss_epoch', float(boundary_losses.avg), epoch)
+            # record lr at epoch end (first param group)
+            try:
+                try:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                except Exception:
+                    current_lr = optimizer.optimizer.param_groups[0]["lr"]
+                tb.add_scalar('train/lr_epoch', float(current_lr), epoch)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return (epoch, losses.avg), queue
 
 
@@ -642,3 +702,6 @@ def validate(val_loader, model):
 
 if __name__ == "__main__":
     main()
+
+
+# python main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 1.0   --epochs 200   --batch_size 128   --base_lr 0.2   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_wtnet_0.2   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0  --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50  --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 45

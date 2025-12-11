@@ -101,7 +101,16 @@ def compute_stage2_from_preds(test_X, test_Y, label_hat_stage1, theta, preds_unk
         unknown_acc_val = float(a / b) if b != 0 else float('nan')
         c = unknown_X_local.shape[0]
         UP_val = float(a / c) if c != 0 else float('nan')
-        stage2.update({'u': 1, 'unknown_acc': unknown_acc_val, 'UP': UP_val})
+        # For u=1 case, we return scalar unknown_acc (recall over all true unknowns)
+        # and UP (precision among predicted-as-unknown). Also include counts for clarity.
+        stage2.update({
+            'u': 1,
+            'unknown_acc': unknown_acc_val,
+            'UP': UP_val,
+            'n_predicted_unknowns': int(c),
+            'n_true_unknowns': int(b),
+            'mean_unknown_acc': float(unknown_acc_val) if not np.isnan(unknown_acc_val) else float('nan')
+        })
         return stage2
 
     # Otherwise use provided preds_unknown

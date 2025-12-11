@@ -17,6 +17,12 @@ from .logger import create_logger, PD_Stats
 
 import torch.distributed as dist
 
+# Optional TensorBoard SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
+
 FALSY_STRINGS = {"off", "false", "0"}
 TRUTHY_STRINGS = {"on", "true", "1"}
 
@@ -113,6 +119,24 @@ def initialize_exp(params, *args, dump_params=True):
     )
     logger.info("The experiment will be stored in %s\n" % params.dump_path)
     logger.info("")
+    # Create a TensorBoard SummaryWriter for this experiment (only on rank 0)
+    try:
+        tb_writer = None
+        # experiment name: last path component of dump_path
+        exp_name = os.path.basename(os.path.abspath(params.dump_path))
+        tb_base = '/root/tf-logs'
+        tb_dir = os.path.join(tb_base, exp_name)
+        if params.rank == 0 and SummaryWriter is not None:
+            os.makedirs(tb_dir, exist_ok=True)
+            tb_writer = SummaryWriter(log_dir=tb_dir)
+            logger.info(f"TensorBoard writer created at: {tb_dir}")
+        else:
+            logger.info("TensorBoard writer not created on this rank or SummaryWriter unavailable")
+        # attach to logger for easy access: logger.tb_writer may be None on non-master ranks
+        logger.tb_writer = tb_writer
+    except Exception:
+        logger.tb_writer = None
+
     return logger, training_stats
 
 

@@ -71,7 +71,7 @@ class MultiPrototypes(nn.Module):
         return out
 
 class ArcFaceClassifier(nn.Module):
-    def __init__(self, in_features, num_classes, s=30.0, m=0.50):
+    def __init__(self, in_features, num_classes, s=30.0, m=0.70):
         super(ArcFaceClassifier, self).__init__()
         self.in_features = in_features
         self.num_classes = num_classes
@@ -167,12 +167,13 @@ class WTNet(nn.Module):
         elif hidden_mlp == 0:
             self.projection_head = nn.Linear(self.semantic_dim, output_dim)
         else:
-            self.projection_head = nn.Sequential(
-                nn.Linear(self.semantic_dim, hidden_mlp),
-                nn.BatchNorm1d(hidden_mlp),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_mlp, output_dim),
-            )
+            self.projection_head = nn.Linear(self.semantic_dim, output_dim)
+            # self.projection_head = nn.Sequential(
+            #     nn.Linear(self.semantic_dim, hidden_mlp),
+            #     nn.BatchNorm1d(hidden_mlp),
+            #     nn.ReLU(inplace=True),
+            #     nn.Linear(hidden_mlp, output_dim),
+            # )
 
         # Prototypes
         self.prototypes = None
