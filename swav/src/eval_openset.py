@@ -178,71 +178,85 @@ def plot_tsne(test_X, test_Y, num_known, dump_path):
         plt.savefig(os.path.join(dump_path, filename), dpi=300)
         plt.close()
 
-    # 1. Known
-    if known_mask.sum() > 0:
-        plot_scatter(
-            X_embedded[known_mask, 0], 
-            X_embedded[known_mask, 1], 
-            test_Y_np[known_mask], 
-            "t-SNE: Known Classes", 
-            "tsne_known.png"
-        )
+    # Plot all
+    plot_scatter(X_embedded[:, 0], X_embedded[:, 1], test_Y_np, "t-SNE (All Classes)", "tsne_all.png")
+    
+    # Plot Known only
+    if np.sum(known_mask) > 0:
+        plot_scatter(X_embedded[known_mask, 0], X_embedded[known_mask, 1], test_Y_np[known_mask], 
+                     "t-SNE (Known Classes)", "tsne_known.png")
+                     
+    # Plot Unknown only
+    if np.sum(unknown_mask) > 0:
+        plot_scatter(X_embedded[unknown_mask, 0], X_embedded[unknown_mask, 1], test_Y_np[unknown_mask], 
+                     "t-SNE (Unknown Classes)", "tsne_unknown.png")
 
-    # 2. Unknown
-    if unknown_mask.sum() > 0:
-        plot_scatter(
-            X_embedded[unknown_mask, 0], 
-            X_embedded[unknown_mask, 1], 
-            test_Y_np[unknown_mask], 
-            "t-SNE: Unknown Classes", 
-            "tsne_unknown.png"
-        )
+def plot_hypersphere_projection(test_E, test_Y, num_known, dump_path, prototypes=None):
+    logger.info("Generating 3D Hypersphere projection plots...")
+    from sklearn.decomposition import PCA
+    from mpl_toolkits.mplot3d import Axes3D
 
-    # 3. Both: plot known and unknown together.
-    plt.figure(figsize=(12, 10))
+    # Normalize embeddings
+    test_E_norm = torch.nn.functional.normalize(test_E, dim=1, p=2)
+    
+    if prototypes is not None:
+        prototypes = torch.nn.functional.normalize(prototypes, dim=1, p=2)
+        combined_data = torch.cat([test_E_norm, prototypes], dim=0)
+        n_samples = test_E_norm.shape[0]
+        n_protos = prototypes.shape[0]
+    else:
+        combined_data = test_E_norm
+        n_samples = test_E_norm.shape[0]
+        n_protos = 0
+        
+    # PCA to 3D
+    pca = PCA(n_components=3)
+    projected = pca.fit_transform(combined_data.numpy())
+    
+    # Re-normalize to project onto the unit sphere
+    projected_norm = projected / np.linalg.norm(projected, axis=1, keepdims=True)
+    
+    X_proj = projected_norm[:n_samples]
+    Proto_proj = projected_norm[n_samples:] if n_protos > 0 else None
+    
+    test_Y_np = test_Y.numpy()
+    
+    # Helper for plotting 3D
+    def plot_3d_scatter(x, y, z, labels, title, filename, cmap='tab20', alpha=0.7, proto_coords=None):
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Draw wireframe sphere
+        u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+        sx = np.cos(u)*np.sin(v)
+        sy = np.sin(u)*np.sin(v)
+        sz = np.cos(v)
+        ax.plot_wireframe(sx, sy, sz, color="gray", alpha=0.1)
+        
+        scatter = ax.scatter(x, y, z, c=labels, cmap=cmap, s=20, alpha=alpha)
+        
+        if proto_coords is not None:
+            ax.scatter(proto_coords[:, 0], proto_coords[:, 1], proto_coords[:, 2], 
+                       marker='*', c='black', s=200, label='Prototypes', edgecolors='white')
+            for i in range(proto_coords.shape[0]):
+                ax.text(proto_coords[i, 0], proto_coords[i, 1], proto_coords[i, 2], 
+                        str(i), fontsize=10, fontweight='bold', color='black')
 
-    # Plot knowns (colored by class) but do NOT create a colorbar legend
-    if known_mask.sum() > 0:
-        plt.scatter(
-            X_embedded[known_mask, 0],
-            X_embedded[known_mask, 1],
-            c=test_Y_np[known_mask],
-            cmap='tab20',
-            s=20,
-            alpha=0.8,
-            linewidths=0,
-        )
+        ax.set_title(title)
+        # Hide axes
+        ax.set_axis_off()
+        plt.tight_layout()
+        plt.savefig(os.path.join(dump_path, filename), dpi=300)
+        plt.close()
 
-    # Plot unknowns: all unknown classes use a single color and a thin black edge
-    if unknown_mask.sum() > 0:
-        unknown_color = 'tab:red'
-        plt.scatter(
-            X_embedded[unknown_mask, 0],
-            X_embedded[unknown_mask, 1],
-            color=unknown_color,
-            s=36,
-            alpha=0.95,
-            edgecolors='k',
-            linewidths=0.25,
-            label='Unknown'
-        )
-
-    # Build a simple legend with two entries: Known and Unknown
-    legend_handles = []
-    try:
-        legend_handles.append(Line2D([0], [0], marker='o', color='w', label='Known',
-                                     markerfacecolor='tab:blue', markersize=8))
-        legend_handles.append(Line2D([0], [0], marker='o', color='w', label='Unknown',
-                                     markerfacecolor=unknown_color, markeredgecolor='k', markersize=8))
-        plt.legend(handles=legend_handles, fontsize=12)
-    except Exception:
-        plt.legend(fontsize=12)
-
-    plt.title("t-SNE: Known vs Unknown", fontsize=16)
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig(os.path.join(dump_path, "tsne_both.png"), dpi=300)
-    plt.close()
+    # Plot all classes
+    plot_3d_scatter(X_proj[:, 0], X_proj[:, 1], X_proj[:, 2], test_Y_np, 
+                    "3D Hypersphere Projection (All Classes)", "sphere_projection_all.png", proto_coords=Proto_proj)
+    
+    # Plot Known vs Unknown
+    binary_labels = (test_Y_np >= num_known).astype(int)
+    plot_3d_scatter(X_proj[:, 0], X_proj[:, 1], X_proj[:, 2], binary_labels, 
+                    "3D Hypersphere Projection (Known vs Unknown)", "sphere_projection_binary.png", cmap='coolwarm', proto_coords=Proto_proj)
 
 def plot_distance_histogram(d_ct, test_Y, num_known, metric_name, dump_path):
     logger.info(f"Generating histogram for {metric_name}...")
@@ -305,10 +319,9 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
             
             # Forward pass
             ret = model(inputs)
-            if len(ret) == 3:
-                embedding, output, logits = ret
-            else:
-                embedding, output = ret
+            embedding = ret[0]
+            output = ret[1]
+            # Ignore logits/aux_logits for training data feature extraction
             
             feats = output.cpu()
             train_features.append(feats)
@@ -323,18 +336,29 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     logger.info("Extracting features from test data...")
     test_features = []
     test_labels = []
+    test_embeddings_list = []
+    test_aux_logits_list = []
     
     # Known test data
     with torch.no_grad():
         for inputs, labels in tqdm(test_loader):
             inputs = inputs.to(device)
             ret = model(inputs)
+            
+            embedding = ret[0]
+            output = ret[1]
+            aux_logits = None
             if len(ret) == 3:
-                embedding, output, logits = ret
-            else:
-                embedding, output = ret
+                if isinstance(ret[2], dict):
+                    aux_logits = ret[2]
+            elif len(ret) == 4:
+                aux_logits = ret[3]
+
             test_features.append(output.cpu())
+            test_embeddings_list.append(embedding.cpu())
             test_labels.append(labels)
+            if aux_logits is not None:
+                test_aux_logits_list.append({k: v.cpu() for k, v in aux_logits.items()})
             
     # Unknown test data
     if unknown_loader:
@@ -342,15 +366,25 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
             for inputs, labels in tqdm(unknown_loader):
                 inputs = inputs.to(device)
                 ret = model(inputs)
+                
+                embedding = ret[0]
+                output = ret[1]
+                aux_logits = None
                 if len(ret) == 3:
-                    embedding, output, logits = ret
-                else:
-                    embedding, output = ret
+                    if isinstance(ret[2], dict):
+                        aux_logits = ret[2]
+                elif len(ret) == 4:
+                    aux_logits = ret[3]
+
                 test_features.append(output.cpu())
+                test_embeddings_list.append(embedding.cpu())
                 test_labels.append(labels)
+                if aux_logits is not None:
+                    test_aux_logits_list.append({k: v.cpu() for k, v in aux_logits.items()})
                 
     test_X = torch.cat(test_features, dim=0)
     test_Y = torch.cat(test_labels, dim=0)
+    test_E = torch.cat(test_embeddings_list, dim=0)
     
     # 3. Evaluate Euclidean Distance
     logger.info("Evaluating with Euclidean Distance...")
@@ -448,99 +482,42 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     except Exception:
         logger.info('Stage2 (Euclidean clustering): unexpected error; skipping')
     
-    # 4. Evaluate Mahalanobis Distance
-    logger.info("Evaluating with Mahalanobis Distance...")
-    d_ct_ma, theta_ma = compute_distances(train_X, train_Y, test_X, num_known, metric='mahalanobis')
-    tkr_ma, tur_ma, kp_ma, fkr_ma, mean_acc_ma, label_hat_ma = evaluate_metric(test_Y, d_ct_ma, theta_ma, num_known, "Mahalanobis Distance")
-
-    # Compute UP (predicted-unknown precision) for Mahalanobis evaluation:
-    try:
-        test_Y_np = test_Y.numpy().copy()
-        test_Y_np[test_Y_np >= num_known] = -1
-        pred_unknown_mask = (label_hat_ma == -1)
-        c = int(np.sum(pred_unknown_mask))
-        a = int(np.sum(test_Y_np[pred_unknown_mask] == -1)) if c > 0 else 0
-        UP_ma = float(a / c) if c > 0 else float('nan')
-        logger.info(f"UP (Mahalanobis): {UP_ma:.4f} (predicted_unknowns={c}, correct_unknowns={a})")
-    except Exception:
-        logger.info("UP (Mahalanobis): could not be computed")
-
-    # --- Stage2-style clustering-based UP (u>1) for Mahalanobis ---
-    try:
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        if repo_root not in sys.path:
-            sys.path.insert(0, repo_root)
+    # --- Consistency Check Strategy ---
+    if test_aux_logits_list:
+        logger.info("Applying Consistency Check Strategy...")
+        
+        # Concatenate aux logits
+        keys = test_aux_logits_list[0].keys()
+        aux_preds = {}
+        for k in keys:
+            logits_k = torch.cat([d[k] for d in test_aux_logits_list], dim=0)
+            aux_preds[k] = torch.argmax(logits_k, dim=1).numpy()
+            
+        # Apply consistency
+        refined_label_hat = label_hat_eu.copy()
+        
+        for k in keys:
+            # If main prediction is known (>=0), it must match branch prediction
+            # If main prediction is unknown (-1), it remains unknown
+            disagreement = (refined_label_hat != -1) & (refined_label_hat != aux_preds[k])
+            refined_label_hat[disagreement] = -1
+            
+        # Re-evaluate metrics
+        test_Y_normalized = test_Y.numpy().copy()
+        test_Y_normalized[test_Y_normalized >= num_known] = -1
+        
+        tkr_cc, tur_cc, kp_cc, fkr_cc, accuracy_cc = metrics_stage_1(test_Y_normalized, refined_label_hat, num_known)
+        
+        logger.info(f"--- Consistency Check Results (Euclidean + Aux) ---")
+        logger.info(f"TKR: {tkr_cc:.4f}, TUR: {tur_cc:.4f}, KP: {kp_cc:.4f}, FKR: {fkr_cc:.4f}")
+        logger.info(f"Mean Known Accuracy: {np.mean(accuracy_cc):.4f}")
+        
+        # Update UP
         try:
-            stage2_mod = importlib.import_module('scripts.stage2_compute_open_set_metrics')
+            pred_unknown_mask = (refined_label_hat == -1)
+            c = int(np.sum(pred_unknown_mask))
+            a = int(np.sum(test_Y_normalized[pred_unknown_mask] == -1)) if c > 0 else 0
+            UP_cc = float(a / c) if c > 0 else float('nan')
+            logger.info(f"UP (Consistency): {UP_cc:.4f} (predicted_unknowns={c}, correct_unknowns={a})")
         except Exception:
-            stage2_mod = None
-
-        test_X_np = test_X.numpy()
-        test_Y_np = test_Y.numpy()
-        label_hat_np = label_hat_ma
-
-        unknown_idx = np.where(label_hat_np == -1)[0]
-        if unknown_idx.size == 0:
-            logger.info('Stage2 (Mahalanobis): no unknown samples predicted by stage1; skipping clustering.')
-        else:
-            X_unknown = test_X_np[unknown_idx]
-            y_unknown = test_Y_np[unknown_idx]
-
-            if stage2_mod is not None and MinMaxScaler is not None and KMeans is not None:
-                scaler = MinMaxScaler()
-                Xs = scaler.fit_transform(X_unknown) if X_unknown.shape[0] > 0 else X_unknown
-                # build candidate k list inclusive and <= n_samples
-                k_min = 2
-                k_max = 14
-                n_samples = Xs.shape[0]
-                max_k = min(k_max, n_samples)
-                if max_k < k_min:
-                    candidates = [k_min]
-                else:
-                    candidates = list(range(k_min, max_k + 1))
-
-                DB = []
-                db_map = {}
-                for ui in candidates:
-                    try:
-                        Cluster = KMeans(n_clusters=ui, init='k-means++', random_state=51).fit(Xs)
-                        pre_label = Cluster.labels_
-                        db = float(skm.davies_bouldin_score(Xs, pre_label)) if Xs.shape[0] > ui and len(set(pre_label)) > 1 else float('inf')
-                    except Exception:
-                        db = float('inf')
-                    DB.append(db)
-                    db_map[ui] = db
-
-                try:
-                    logger.info(f"Stage2 (Mahalanobis clustering): DB scores by k: {db_map}")
-                except Exception:
-                    pass
-
-                try:
-                    best_k = candidates[int(np.nanargmin(np.array(DB)))]
-                except Exception:
-                    best_k = candidates[0]
-
-                Cluster = KMeans(n_clusters=best_k, init='k-means++', random_state=51).fit(Xs)
-                preds = Cluster.labels_
-                try:
-                    st2 = stage2_mod.compute_stage2_from_preds(test_X_np, test_Y_np, label_hat_np, theta_ma.numpy() if hasattr(theta_ma, 'numpy') else theta_ma, preds, num_known)
-                    if isinstance(st2, dict):
-                        logger.info(f"Stage2 (Mahalanobis clustering) chosen_k={best_k} -> {st2}")
-                    else:
-                        logger.info('Stage2 (Mahalanobis clustering): result has no UP')
-                except Exception as e:
-                    logger.info(f'Stage2 (Mahalanobis clustering): failed to compute stage2 via helper: {e}')
-            else:
-                logger.info('Stage2 (Mahalanobis clustering): sklearn or helper not available; skipping clustering-based UP')
-    except Exception:
-        logger.info('Stage2 (Mahalanobis clustering): unexpected error; skipping')
-    
-    # 5. t-SNE Plotting
-    plot_tsne(test_X, test_Y, num_known, args.dump_path)
-    
-    # 6. Distance Histogram
-    plot_distance_histogram(d_ct_eu, test_Y, num_known, "Euclidean Distance", args.dump_path)
-    plot_distance_histogram(d_ct_ma, test_Y, num_known, "Mahalanobis Distance", args.dump_path)
-    
-    logger.info("Evaluation complete. Plots saved to dump path.")
+            pass

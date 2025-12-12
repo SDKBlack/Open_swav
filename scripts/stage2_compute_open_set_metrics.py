@@ -61,7 +61,7 @@ def metrics_stage_1(true_label, predict_label, num_known_local):
     return tkr, tur, kp, fkr, accuracy
 
 
-def compute_stage2_from_preds(test_X, test_Y, label_hat_stage1, theta, preds_unknown, num_known, stage2_dominance=0.4, force_clusterize=False):
+def compute_stage2_from_preds(test_X, test_Y, label_hat_stage1, theta, preds_unknown, num_known, stage2_dominance=0.4, force_clusterize=True):
     # preds_unknown: length = n_unknown, cluster labels 0..u-1 (DBSCAN may have -1 for noise)
     unknown_idx = np.where(label_hat_stage1 == -1)[0]
     unknown_X_local = test_X[unknown_idx]
@@ -157,7 +157,7 @@ def compute_stage2_from_preds(test_X, test_Y, label_hat_stage1, theta, preds_unk
     return stage2
 
 
-def cluster_and_eval(exp_dir, method, k_min=2, k_max=14, dbscan_eps_list=[0.5,1.0,1.5,2.0], stage2_dominance=0.4, force_clusterize=False):
+def cluster_and_eval(exp_dir, method, k_min=2, k_max=14, dbscan_eps_list=[0.5,1.0,1.5,2.0], stage2_dominance=0.4, force_clusterize=True):
     # load necessary artifacts
     test_X = np.load(os.path.join(exp_dir, 'test_X.npy'))
     test_Y = np.load(os.path.join(exp_dir, 'test_Y.npy'))

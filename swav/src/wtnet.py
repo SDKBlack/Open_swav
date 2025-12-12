@@ -71,7 +71,7 @@ class MultiPrototypes(nn.Module):
         return out
 
 class ArcFaceClassifier(nn.Module):
-    def __init__(self, in_features, num_classes, s=30.0, m=0.70):
+    def __init__(self, in_features, num_classes, s=30.0, m=0.9):
         super(ArcFaceClassifier, self).__init__()
         self.in_features = in_features
         self.num_classes = num_classes
@@ -104,16 +104,90 @@ class ArcFaceClassifier(nn.Module):
         return output
 
 
+class MPNCOV(nn.Module):
+    def __init__(self, iter_num=3):
+        super(MPNCOV, self).__init__()
+        self.iter_num = iter_num
+
+    def forward(self, x):
+        # x: B, C, H, W
+        B, C, H, W = x.shape
+        x = x.view(B, C, -1) # B, C, N
+        N = H * W
+        x = x - x.mean(dim=2, keepdim=True)
+        sigma = torch.bmm(x, x.transpose(1, 2)) / (N - 1) # B, C, C
+        
+        # Matrix Square Root via Newton-Schulz
+        # Pre-normalization for stability
+        trace = sigma.diagonal(dim1=-2, dim2=-1).sum(-1, keepdim=True).unsqueeze(-1) # B, 1, 1
+        sigma = sigma / (trace + 1e-6)
+        
+        Y = sigma
+        I = torch.eye(C, device=sigma.device).unsqueeze(0).expand(B, C, C)
+        Z = I
+        
+        for i in range(self.iter_num):
+            T = 0.5 * (3.0 * I - torch.bmm(Z, Y))
+            Y = torch.bmm(Y, T)
+            Z = torch.bmm(T, Z)
+            
+        sigma_sqrt = Y * torch.sqrt(trace + 1e-6)
+        
+        # Upper triangular part
+        triu_indices = torch.triu_indices(C, C, device=sigma.device)
+        out = sigma_sqrt[:, triu_indices[0], triu_indices[1]]
+        
+        return out # B, C*(C+1)/2
+
+class SelectiveKernelFusion(nn.Module):
+    def __init__(self, channels, branches=3, reduction=16):
+        super(SelectiveKernelFusion, self).__init__()
+        self.channels = channels
+        d = max(channels // reduction, 32)
+        self.fc1 = nn.Linear(channels, d)
+        self.fc2 = nn.Linear(d, channels * branches)
+        self.softmax = nn.Softmax(dim=1)
+        self.branches = branches
+
+    def forward(self, x_list):
+        # x_list: list of [B, C, H, W]
+        batch_size = x_list[0].shape[0]
+        
+        # Fuse: Element-wise Sum
+        U = sum(x_list) # [B, C, H, W]
+        
+        # Global Avg Pool
+        s = U.mean([-2, -1]) # [B, C]
+        
+        # Compact feature
+        z = self.fc1(s) # [B, d]
+        z = F.relu(z)
+        
+        # Attention weights
+        weights = self.fc2(z) # [B, C*branches]
+        weights = weights.view(batch_size, self.branches, self.channels)
+        weights = self.softmax(weights) # [B, branches, C]
+        
+        # Weighted Sum
+        V = 0
+        for i, x in enumerate(x_list):
+            w = weights[:, i, :].unsqueeze(-1).unsqueeze(-1) # [B, C, 1, 1]
+            V += w * x
+            
+        return V
+
 class WTNet(nn.Module):
     def __init__(self, in_channels=3, input_size=[512, 512], semantic_dim=128, num_classes=0, 
                  output_dim=0, hidden_mlp=0, nmb_prototypes=0, eval_mode=False, normalize=False,
-                 use_attention=True, attn_heads=8, use_shared_stem=False, shared_stem_blocks=2):
+                 use_attention=True, attn_heads=8, use_shared_stem=False, shared_stem_blocks=2,
+                 use_sk_fusion=False, pooling_type='gem', use_aux_heads=False):
         super(WTNet, self).__init__()
         
         # SwAV specific params
         self.eval_mode = eval_mode
         self.l2norm = normalize
         self.num_classes = num_classes
+        self.use_aux_heads = use_aux_heads
         
         # Network params
         self.in_channels = in_channels
@@ -122,6 +196,8 @@ class WTNet(nn.Module):
         self.attn_heads = attn_heads
         self.use_shared_stem = use_shared_stem
         self.shared_stem_blocks = shared_stem_blocks
+        self.use_sk_fusion = use_sk_fusion
+        self.pooling_type = pooling_type
         
         # If requested, create a shared stem to reduce repeated computation across branches.
         # The stem will execute the first `shared_stem_blocks` blocks once and then each
@@ -139,9 +215,15 @@ class WTNet(nn.Module):
             self.encoder_d3 = self._make_branch(kernel_size=3, start_block=0)
             self.encoder_d5 = self._make_branch(kernel_size=5, start_block=0)
         
-        # Encoder to Semantic (Projection)
-        # 128 channels * 3 branches = 384
-        self.feature_dim = 128 * 3
+        # Feature Fusion
+        if self.use_sk_fusion:
+            self.sk_fusion = SelectiveKernelFusion(128, branches=3)
+            self.feature_dim = 128
+        else:
+            self.sk_fusion = None
+            # 128 channels * 3 branches = 384
+            self.feature_dim = 128 * 3
+
         # Attention module (applied on concatenated feature map before pooling)
         if self.use_attention:
             # self.attn = MHSA2D(self.feature_dim, num_heads=self.attn_heads)
@@ -149,8 +231,15 @@ class WTNet(nn.Module):
         else:
             self.attn = None
         
-        # GeM Pooling
-        self.gem = GeM()
+        # Pooling
+        if self.pooling_type == 'mpn':
+            self.pool = MPNCOV()
+            # MPN-COV output dimension is C*(C+1)/2
+            self.feature_dim = self.feature_dim * (self.feature_dim + 1) // 2
+        elif self.pooling_type == 'gem':
+            self.pool = GeM()
+        else:
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
         
         self.encoder_to_semantic = nn.Sequential(
             nn.Linear(self.feature_dim, self.semantic_dim*2),
@@ -160,6 +249,39 @@ class WTNet(nn.Module):
             nn.BatchNorm1d(self.semantic_dim),
             # nn.ReLU()
         )
+        
+        # Auxiliary Heads
+        if self.use_aux_heads and self.num_classes > 0:
+            # Each branch outputs 128 channels
+            # We need a pooling layer and a linear classifier for each
+            # We'll reuse the same pooling type as main branch for consistency, 
+            # but we need separate instances if they have learnable params (like GeM)
+            # MPNCOV might be too heavy for aux heads? Let's stick to main pooling type.
+            
+            def make_aux_head(in_dim):
+                pool = None
+                feat_dim = in_dim
+                if self.pooling_type == 'mpn':
+                    pool = MPNCOV()
+                    feat_dim = in_dim * (in_dim + 1) // 2
+                elif self.pooling_type == 'gem':
+                    pool = GeM()
+                else:
+                    pool = nn.AdaptiveAvgPool2d((1, 1))
+                
+                return nn.Sequential(
+                    pool,
+                    nn.Flatten(),
+                    nn.Linear(feat_dim, self.num_classes)
+                )
+
+            self.aux_head1 = make_aux_head(128)
+            self.aux_head3 = make_aux_head(128)
+            self.aux_head5 = make_aux_head(128)
+        else:
+            self.aux_head1 = None
+            self.aux_head3 = None
+            self.aux_head5 = None
         
         # SwAV Projection Head
         if output_dim == 0:
@@ -257,8 +379,18 @@ class WTNet(nn.Module):
             e3 = self.encoder_d3(x)
             e5 = self.encoder_d5(x)
 
-        # Concatenate
-        out = torch.cat([e1, e3, e5], dim=1)  # [B, 128*3, H, W]
+        # Auxiliary Heads Forward
+        aux_logits = {}
+        if self.use_aux_heads and self.aux_head1 is not None:
+            aux_logits['1'] = self.aux_head1(e1)
+            aux_logits['3'] = self.aux_head3(e3)
+            aux_logits['5'] = self.aux_head5(e5)
+
+        # Concatenate or Fuse
+        if self.sk_fusion is not None:
+            out = self.sk_fusion([e1, e3, e5]) # [B, 128, H, W]
+        else:
+            out = torch.cat([e1, e3, e5], dim=1)  # [B, 128*3, H, W]
 
         # optional attention on spatial features
         if self.attn is not None:
@@ -266,13 +398,13 @@ class WTNet(nn.Module):
 
         # Global Pooling
         # out = F.adaptive_avg_pool2d(out, (1, 1))
-        out = self.gem(out)
+        out = self.pool(out)
         out = out.view(out.size(0), -1)
 
         # Encoder to Semantic
         out = self.encoder_to_semantic(out)
 
-        return out
+        return out, aux_logits
 
     def forward_head(self, x):
         if self.projection_head is not None:
@@ -293,13 +425,25 @@ class WTNet(nn.Module):
             return_counts=True,
         )[1], 0)
         start_idx = 0
+        aux_logits_list = []
         for end_idx in idx_crops:
-            _out = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
+            _out, _aux = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
             if start_idx == 0:
                 output = _out
             else:
                 output = torch.cat((output, _out))
+            
+            # Collect aux logits if available
+            if _aux:
+                aux_logits_list.append(_aux)
+                
             start_idx = end_idx
+        
+        # Concatenate aux logits across crops
+        final_aux_logits = {}
+        if aux_logits_list:
+            for k in aux_logits_list[0].keys():
+                final_aux_logits[k] = torch.cat([d[k] for d in aux_logits_list], dim=0)
         
         logits = None
         if self.classifier is not None:
@@ -339,5 +483,10 @@ class WTNet(nn.Module):
         self._last_backbone = output
         
         if logits is not None:
+            if self.use_aux_heads:
+                return embedding, proto_out, logits, final_aux_logits
             return embedding, proto_out, logits
+        
+        if self.use_aux_heads:
+            return embedding, proto_out, final_aux_logits
         return embedding, proto_out

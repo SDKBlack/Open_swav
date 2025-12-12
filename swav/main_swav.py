@@ -143,6 +143,22 @@ parser.add_argument("--boundary_pos_anneal_epochs", type=int, default=0, help="n
 parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
 parser.add_argument("--tb_log_interval", type=int, default=50, help="TensorBoard logging interval in iterations (only on rank 0)")
 
+#########################
+#### WTNet specific params
+#########################
+parser.add_argument("--use_shared_stem", type=bool_flag, default=False,
+                    help="Whether to use a shared stem for WTNet branches")
+parser.add_argument("--shared_stem_blocks", type=int, default=2,
+                    help="Number of blocks in the shared stem (1-6)")
+parser.add_argument("--use_sk_fusion", type=bool_flag, default=False,
+                    help="Whether to use Selective Kernel Fusion for WTNet branches")
+parser.add_argument("--pooling_type", type=str, default="gem", choices=["gem", "mpn", "avg"],
+                    help="Pooling type: gem, mpn (MPN-COV), or avg")
+parser.add_argument("--use_aux_heads", type=bool_flag, default=False,
+                    help="Whether to use auxiliary classification heads for each branch")
+parser.add_argument("--aux_loss_weight", type=float, default=1.0,
+                    help="Weight for auxiliary classification loss")
+
 
 def main():
     global args
@@ -198,6 +214,11 @@ def main():
             output_dim=args.feat_dim,
             nmb_prototypes=args.nmb_prototypes,
             num_classes=args.num_classes,
+            use_shared_stem=args.use_shared_stem,
+            shared_stem_blocks=args.shared_stem_blocks,
+            use_sk_fusion=args.use_sk_fusion,
+            pooling_type=args.pooling_type,
+            use_aux_heads=args.use_aux_heads,
         )
     else:
         model = resnet_models.__dict__[args.arch](
@@ -420,6 +441,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
     boundary_losses = AverageMeter()
 
     ce_losses = AverageMeter()
+    aux_losses = AverageMeter()
 
     model.train()
     use_the_queue = False
@@ -447,28 +469,77 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             model.module.prototypes.weight.copy_(w)
 
         # ============ multi-res forward passes ... ============
+        aux_logits = None
         if args.use_fp16:
             with torch.cuda.amp.autocast():
                 ret = model(inputs, labels)
+                # Handle variable return length
+                # Possible returns:
+                # (embedding, output)
+                # (embedding, output, logits)
+                # (embedding, output, aux_logits)
+                # (embedding, output, logits, aux_logits)
+                
+                embedding = ret[0]
+                output = ret[1]
+                logits = None
+                aux_logits = None
+                
                 if len(ret) == 3:
-                    embedding, output, logits = ret
-                else:
-                    embedding, output = ret
-                    logits = None
+                    if isinstance(ret[2], dict):
+                        aux_logits = ret[2]
+                    else:
+                        logits = ret[2]
+                elif len(ret) == 4:
+                    logits = ret[2]
+                    aux_logits = ret[3]
         else:
             ret = model(inputs, labels)
+            embedding = ret[0]
+            output = ret[1]
+            logits = None
+            aux_logits = None
+            
             if len(ret) == 3:
-                embedding, output, logits = ret
-            else:
-                embedding, output = ret
-                logits = None
+                if isinstance(ret[2], dict):
+                    aux_logits = ret[2]
+                else:
+                    logits = ret[2]
+            elif len(ret) == 4:
+                logits = ret[2]
+                aux_logits = ret[3]
             
         embedding_detached = embedding.detach()
         bs = inputs[0].size(0)
 
+        # === Defensive runtime checks: detect non-finite tensors early ===
+        def _check_finite(tensor, name):
+            try:
+                if tensor is None:
+                    return
+                if isinstance(tensor, torch.Tensor):
+                    if not torch.isfinite(tensor).all():
+                        logger.error(f"Non-finite values detected in {name}: min={torch.min(tensor):.6f}, max={torch.max(tensor):.6f}")
+                        raise ValueError(f"Non-finite values in {name}")
+                elif isinstance(tensor, dict):
+                    for k, v in tensor.items():
+                        if not torch.isfinite(v).all():
+                            logger.error(f"Non-finite values detected in {name}[{k}]: min={torch.min(v):.6f}, max={torch.max(v):.6f}")
+                            raise ValueError(f"Non-finite values in {name}[{k}]")
+            except Exception:
+                # Re-raise so training stops and user can inspect
+                raise
+
+        # quick checks
+        _check_finite(output, 'output')
+        _check_finite(embedding, 'embedding')
+        _check_finite(logits, 'logits')
+        _check_finite(aux_logits, 'aux_logits')
+
         # ============ swav loss ... ============
         loss = 0
         boundary_loss = 0
+        aux_loss = 0
         for i, crop_id in enumerate(args.crops_for_assign):
             with torch.no_grad():
                 out = output[bs * crop_id: bs * (crop_id + 1)].detach()
@@ -502,6 +573,12 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         if logits is not None and labels is not None:
             ce_loss = nn.CrossEntropyLoss()(logits[:bs], labels)
             ce_losses.update(ce_loss.item(), bs)
+
+        # ============ Aux loss ... ============
+        if aux_logits is not None and labels is not None:
+            for k, v in aux_logits.items():
+                aux_loss += nn.CrossEntropyLoss()(v[:bs], labels)
+            aux_losses.update(aux_loss.item(), bs)
             
         # ============ Boundary Loss ... ============
         boundary_loss = 0
@@ -540,7 +617,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 boundary_loss = boundary_criterion(backbone_feats, labels_expanded)
                 boundary_losses.update(boundary_loss.item(), bs)
         
-        total_loss = args.swav_weight * loss + ce_loss + args.boundary_loss_weight * boundary_loss
+        total_loss = args.swav_weight * loss + ce_loss + args.boundary_loss_weight * boundary_loss + args.aux_loss_weight * aux_loss
 
         # ============ backward and optim step ... ============
         optimizer.zero_grad()
@@ -556,11 +633,36 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 if "prototypes" in name:
                     p.grad = None
         
-        if args.use_fp16:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
+        # === Gradient clipping to avoid exploding gradients (helps NaN stability) ===
+        max_norm = 1.0
+        try:
+            if args.use_fp16:
+                # Unscale gradients before clipping when using GradScaler
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                optimizer.step()
+        except Exception:
+            # Fallback: try clipping without unscale (in case scaler/optimizer mismatch)
+            try:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            except Exception:
+                pass
+            try:
+                if args.use_fp16:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+            except Exception:
+                # last-resort: call optimizer.step() without clipping
+                try:
+                    optimizer.step()
+                except Exception:
+                    pass
 
         # ============ misc ... ============
         losses.update(total_loss.item(), inputs[0].size(0))
@@ -571,9 +673,10 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 "Epoch: [{0}][{1}]\t"
                 "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
                 "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                "SWAV Loss {loss.val:.4f} ({loss.avg:.4f})\t"
-                "CE Loss {ce_loss.val:.4f} ({ce_loss.avg:.4f})\t"
-                "B Loss {b_loss.val:.4f} ({b_loss.avg:.4f})\t"
+                    "SWAV Loss {loss.val:.4f} ({loss.avg:.4f})\t"
+                    "CE Loss {ce_loss.val:.4f} ({ce_loss.avg:.4f})\t"
+                    "Aux Loss {aux_loss.val:.4f} ({aux_loss.avg:.4f})\t"
+                    "B Loss {b_loss.val:.4f} ({b_loss.avg:.4f})\t"
                 "Lr: {lr:.4f}".format(
                     epoch,
                     it,
@@ -581,7 +684,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                     data_time=data_time,
                     loss=losses,
                     ce_loss=ce_losses,
-                    b_loss=boundary_losses,
+                        aux_loss=aux_losses,
+                        b_loss=boundary_losses,
                     lr=optimizer.optimizer.param_groups[0]["lr"],
                 )
             )
@@ -609,6 +713,14 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                         tb.add_scalar('train/boundary_loss_iter', float(boundary_loss.item()), global_step)
                     except Exception:
                         tb.add_scalar('train/boundary_loss_iter', float(boundary_loss), global_step)
+                    # aux loss
+                    try:
+                        tb.add_scalar('train/aux_loss_iter', float(aux_loss.item()), global_step)
+                    except Exception:
+                        try:
+                            tb.add_scalar('train/aux_loss_iter', float(aux_loss), global_step)
+                        except Exception:
+                            pass
                     # learning rate
                     try:
                         current_lr = None
@@ -631,6 +743,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         if tb is not None and args.rank == 0:
             tb.add_scalar('train/total_loss_epoch', float(losses.avg), epoch)
             tb.add_scalar('train/ce_loss_epoch', float(ce_losses.avg), epoch)
+            tb.add_scalar('train/aux_loss_epoch', float(aux_losses.avg), epoch)
             tb.add_scalar('train/boundary_loss_epoch', float(boundary_losses.avg), epoch)
             # record lr at epoch end (first param group)
             try:
@@ -649,7 +762,13 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
 
 @torch.no_grad()
 def distributed_sinkhorn(out):
-    Q = torch.exp(out / args.epsilon).t() # Q is K-by-B for consistency with notations from our paper
+    # Prevent numerical overflow in the exponential by clamping the scaled logits.
+    # Scaling factor 1/epsilon can be large if epsilon is small (default 0.05),
+    # which may produce Inf/NaN in torch.exp and break Sinkhorn.
+    scaled = out / args.epsilon
+    # clamp to a safe range to avoid exp overflow
+    scaled = torch.clamp(scaled, min=-50.0, max=50.0)
+    Q = torch.exp(scaled).t() # Q is K-by-B for consistency with notations from our paper
     B = Q.shape[1] * args.world_size # number of samples to assign
     K = Q.shape[0] # how many prototypes
 
@@ -704,4 +823,4 @@ if __name__ == "__main__":
     main()
 
 
-# python main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 1.0   --epochs 200   --batch_size 128   --base_lr 0.2   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_wtnet_0.2   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0  --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50  --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 45
+# torchrun --nproc_per_node=2 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.4   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_wtnet_m0.9_sk_mpn_pro72_sl0.1   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 72

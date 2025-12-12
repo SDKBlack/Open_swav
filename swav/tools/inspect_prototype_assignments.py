@@ -89,6 +89,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None, help='optional checkpoint to load')
     parser.add_argument("--device", type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--crops_for_assign", type=int, nargs='+', default=[0,1])
+    parser.add_argument("--use_sk_fusion", type=lambda x: (str(x).lower() == 'true'), default=False)
+    parser.add_argument("--pooling_type", type=str, default='gem')
     args = parser.parse_args()
 
     dataset = IndexedS3R(
@@ -109,12 +111,18 @@ def main():
         input_size=[512,512],
         semantic_dim=128,
         num_classes=0,
-        output_dim= args.nmb_prototypes,  # ensure projection output dims match prototypes size
+        output_dim=128,
         hidden_mlp=0,
         nmb_prototypes=args.nmb_prototypes,
+        use_sk_fusion=args.use_sk_fusion,
+        pooling_type=args.pooling_type,
     )
     if args.checkpoint is not None:
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        try:
+            ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        except TypeError:
+            # Fallback for older pytorch versions that don't support weights_only
+            ckpt = torch.load(args.checkpoint, map_location='cpu')
         # try to load state_dict if present
         if 'state_dict' in ckpt:
             state = ckpt['state_dict']
