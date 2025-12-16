@@ -268,11 +268,21 @@ class WTNet(nn.Module):
                     pool = GeM()
                 else:
                     pool = nn.AdaptiveAvgPool2d((1, 1))
-                
+                # If this pool is GeM and we're creating an auxiliary head, freeze its learned p
+                # to avoid unstable gradients coming from auxiliary classifier losses.
+                if isinstance(pool, GeM):
+                    try:
+                        pool.p.requires_grad = False
+                    except Exception:
+                        pass
+
                 return nn.Sequential(
                     pool,
                     nn.Flatten(),
-                    nn.Linear(feat_dim, self.num_classes)
+                    nn.Linear(feat_dim, self.semantic_dim),
+                    nn.BatchNorm1d(self.semantic_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(self.semantic_dim, self.num_classes)
                 )
 
             self.aux_head1 = make_aux_head(128)

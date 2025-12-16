@@ -442,6 +442,10 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
 
     ce_losses = AverageMeter()
     aux_losses = AverageMeter()
+    # per-aux-head meters for debugging
+    aux1_losses = AverageMeter()
+    aux3_losses = AverageMeter()
+    aux5_losses = AverageMeter()
 
     model.train()
     use_the_queue = False
@@ -513,28 +517,63 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         bs = inputs[0].size(0)
 
         # === Defensive runtime checks: detect non-finite tensors early ===
-        def _check_finite(tensor, name):
-            try:
-                if tensor is None:
-                    return
-                if isinstance(tensor, torch.Tensor):
-                    if not torch.isfinite(tensor).all():
-                        logger.error(f"Non-finite values detected in {name}: min={torch.min(tensor):.6f}, max={torch.max(tensor):.6f}")
-                        raise ValueError(f"Non-finite values in {name}")
-                elif isinstance(tensor, dict):
-                    for k, v in tensor.items():
-                        if not torch.isfinite(v).all():
-                            logger.error(f"Non-finite values detected in {name}[{k}]: min={torch.min(v):.6f}, max={torch.max(v):.6f}")
-                            raise ValueError(f"Non-finite values in {name}[{k}]")
-            except Exception:
-                # Re-raise so training stops and user can inspect
-                raise
+        def _check_and_dump(tensor, name):
+            if tensor is None:
+                return
+            if isinstance(tensor, torch.Tensor):
+                if not torch.isfinite(tensor).all():
+                    logger.error(f"Non-finite values detected in {name}: min={torch.min(tensor):.6f}, max={torch.max(tensor):.6f}")
+                    # save debug dump
+                    dbg_path = os.path.join(args.dump_path, f"nan_debug_epoch{epoch}_iter{it}.pth")
+                    try:
+                        dbg = {
+                            'epoch': epoch,
+                            'iter': it,
+                            'name': name,
+                            'inputs': [inp.cpu() for inp in inputs] if isinstance(inputs, list) else inputs.cpu(),
+                            'labels': labels.cpu() if labels is not None else None,
+                            'embedding': embedding.detach().cpu() if isinstance(embedding, torch.Tensor) else None,
+                            'output': output.detach().cpu() if isinstance(output, torch.Tensor) else None,
+                            'logits': logits.detach().cpu() if isinstance(logits, torch.Tensor) else None,
+                            'aux_logits': {k: v.detach().cpu() for k, v in aux_logits.items()} if isinstance(aux_logits, dict) else None,
+                            'model_state': model.module.state_dict(),
+                            'optimizer_state': optimizer.state_dict(),
+                        }
+                        torch.save(dbg, dbg_path)
+                        logger.error(f"Saved NaN debug dump to: {dbg_path}")
+                    except Exception as e:
+                        logger.exception(f"Failed to save debug dump: {e}")
+                    raise ValueError(f"Non-finite values in {name}")
+            elif isinstance(tensor, dict):
+                for k, v in tensor.items():
+                    if not torch.isfinite(v).all():
+                        logger.error(f"Non-finite values detected in {name}[{k}]: min={torch.min(v):.6f}, max={torch.max(v):.6f}")
+                        dbg_path = os.path.join(args.dump_path, f"nan_debug_epoch{epoch}_iter{it}_{k}.pth")
+                        try:
+                            dbg = {
+                                'epoch': epoch,
+                                'iter': it,
+                                'name': f"{name}[{k}]",
+                                'inputs': [inp.cpu() for inp in inputs] if isinstance(inputs, list) else inputs.cpu(),
+                                'labels': labels.cpu() if labels is not None else None,
+                                'embedding': embedding.detach().cpu() if isinstance(embedding, torch.Tensor) else None,
+                                'output': output.detach().cpu() if isinstance(output, torch.Tensor) else None,
+                                'logits': logits.detach().cpu() if isinstance(logits, torch.Tensor) else None,
+                                'aux_logits': {k: v.detach().cpu() for k, v in aux_logits.items()} if isinstance(aux_logits, dict) else None,
+                                'model_state': model.module.state_dict(),
+                                'optimizer_state': optimizer.state_dict(),
+                            }
+                            torch.save(dbg, dbg_path)
+                            logger.error(f"Saved NaN debug dump to: {dbg_path}")
+                        except Exception as e:
+                            logger.exception(f"Failed to save debug dump: {e}")
+                        raise ValueError(f"Non-finite values in {name}[{k}]")
 
-        # quick checks
-        _check_finite(output, 'output')
-        _check_finite(embedding, 'embedding')
-        _check_finite(logits, 'logits')
-        _check_finite(aux_logits, 'aux_logits')
+        # quick checks (will save debug dump and raise if non-finite)
+        _check_and_dump(output, 'output')
+        _check_and_dump(embedding, 'embedding')
+        _check_and_dump(logits, 'logits')
+        _check_and_dump(aux_logits, 'aux_logits')
 
         # ============ swav loss ... ============
         loss = 0
@@ -576,9 +615,26 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
 
         # ============ Aux loss ... ============
         if aux_logits is not None and labels is not None:
+            # compute per-aux-head loss separately for better debugging
+            aux_loss_dict = {}
             for k, v in aux_logits.items():
-                aux_loss += nn.CrossEntropyLoss()(v[:bs], labels)
+                try:
+                    loss_k = nn.CrossEntropyLoss()(v[:bs], labels)
+                except Exception:
+                    # If CE throws (e.g., due to shape mismatch), rethrow after saving
+                    logger.exception(f"Error computing CE for aux head {k}")
+                    raise
+                aux_loss_dict[k] = loss_k
+                aux_loss += loss_k
+
+            # update meters: total and per-head
             aux_losses.update(aux_loss.item(), bs)
+            if '1' in aux_loss_dict:
+                aux1_losses.update(aux_loss_dict['1'].item(), bs)
+            if '3' in aux_loss_dict:
+                aux3_losses.update(aux_loss_dict['3'].item(), bs)
+            if '5' in aux_loss_dict:
+                aux5_losses.update(aux_loss_dict['5'].item(), bs)
             
         # ============ Boundary Loss ... ============
         boundary_loss = 0
@@ -627,6 +683,36 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             #     scaled_loss.backward()
         else:
             total_loss.backward()
+        # === Check gradients for non-finite values before optimizer step ===
+        def _check_grads_and_dump():
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    logger.error(f"Non-finite gradient detected in {name}")
+                    dbg_path = os.path.join(args.dump_path, f"nan_grad_debug_epoch{epoch}_iter{it}.pth")
+                    try:
+                        dbg = {
+                            'epoch': epoch,
+                            'iter': it,
+                            'problem': 'grad',
+                            'bad_param': name,
+                            'inputs': [inp.cpu() for inp in inputs] if isinstance(inputs, list) else inputs.cpu(),
+                            'labels': labels.cpu() if labels is not None else None,
+                            'embedding': embedding.detach().cpu() if isinstance(embedding, torch.Tensor) else None,
+                            'output': output.detach().cpu() if isinstance(output, torch.Tensor) else None,
+                            'logits': logits.detach().cpu() if isinstance(logits, torch.Tensor) else None,
+                            'aux_logits': {k: v.detach().cpu() for k, v in aux_logits.items()} if isinstance(aux_logits, dict) else None,
+                            'model_state': model.module.state_dict(),
+                            'optimizer_state': optimizer.state_dict(),
+                        }
+                        torch.save(dbg, dbg_path)
+                        logger.error(f"Saved gradient NaN debug dump to: {dbg_path}")
+                    except Exception as e:
+                        logger.exception(f"Failed to save grad debug dump: {e}")
+                    raise ValueError(f"Non-finite gradients in {name}")
+
+        _check_grads_and_dump()
         # cancel gradients for the prototypes
         if iteration < args.freeze_prototypes_niters:
             for name, p in model.named_parameters():
@@ -645,6 +731,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
                 optimizer.step()
+
+        
         except Exception:
             # Fallback: try clipping without unscale (in case scaler/optimizer mismatch)
             try:
@@ -721,6 +809,17 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                             tb.add_scalar('train/aux_loss_iter', float(aux_loss), global_step)
                         except Exception:
                             pass
+                            # per-aux head scalars
+                            try:
+                                if '1' in locals() and 'aux_loss_dict' in locals():
+                                    if '1' in aux_loss_dict:
+                                        tb.add_scalar('train/aux1_loss_iter', float(aux_loss_dict['1'].item()), global_step)
+                                    if '3' in aux_loss_dict:
+                                        tb.add_scalar('train/aux3_loss_iter', float(aux_loss_dict['3'].item()), global_step)
+                                    if '5' in aux_loss_dict:
+                                        tb.add_scalar('train/aux5_loss_iter', float(aux_loss_dict['5'].item()), global_step)
+                            except Exception:
+                                pass
                     # learning rate
                     try:
                         current_lr = None
@@ -744,6 +843,9 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             tb.add_scalar('train/total_loss_epoch', float(losses.avg), epoch)
             tb.add_scalar('train/ce_loss_epoch', float(ce_losses.avg), epoch)
             tb.add_scalar('train/aux_loss_epoch', float(aux_losses.avg), epoch)
+            tb.add_scalar('train/aux1_loss_epoch', float(aux1_losses.avg), epoch)
+            tb.add_scalar('train/aux3_loss_epoch', float(aux3_losses.avg), epoch)
+            tb.add_scalar('train/aux5_loss_epoch', float(aux5_losses.avg), epoch)
             tb.add_scalar('train/boundary_loss_epoch', float(boundary_losses.avg), epoch)
             # record lr at epoch end (first param group)
             try:
@@ -823,4 +925,4 @@ if __name__ == "__main__":
     main()
 
 
-# torchrun --nproc_per_node=2 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.4   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_wtnet_m0.9_sk_mpn_pro72_sl0.1   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 72
+# torchrun --nproc_per_node=1 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.1   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_wtnet_aux_heads_MLP   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 90   --use_aux_heads True   --aux_loss_weight 0.1
