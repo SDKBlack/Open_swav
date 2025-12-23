@@ -49,13 +49,13 @@ def main():
 
     # WTNet baseline (no shared stem)
     print('\nBuilding WTNet (no shared stem)...')
-    w_no_share = WTNet(normalize=True, hidden_mlp=2048, output_dim=128, nmb_prototypes=0, num_classes=0, use_shared_stem=False, use_attention=False)
+    w_no_share = WTNet(normalize=True, hidden_mlp=2048, output_dim=128, nmb_prototypes=0, num_classes=0, use_shared_stem=False)
     w_no_share = w_no_share.to(device)
     print('wtnet (no share) params:', count_params(w_no_share))
 
     # WTNet with shared stem
     print('\nBuilding WTNet (with shared stem)...')
-    w_share = WTNet(normalize=True, hidden_mlp=2048, output_dim=128, nmb_prototypes=0, num_classes=0, use_shared_stem=True, shared_stem_blocks=2, use_attention=False)
+    w_share = WTNet(normalize=True, hidden_mlp=2048, output_dim=128, nmb_prototypes=0, num_classes=0, use_shared_stem=True, shared_stem_blocks=2)
     w_share = w_share.to(device)
     print('wtnet (shared stem) params:', count_params(w_share))
 

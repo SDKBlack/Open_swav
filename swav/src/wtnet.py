@@ -20,43 +20,6 @@ class GeM(nn.Module):
         return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
 
 
-class CoordinateAttention(nn.Module):
-    def __init__(self, inp, oup, reduction=32):
-        super(CoordinateAttention, self).__init__()
-        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
-        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
-
-        mip = max(8, inp // reduction)
-
-        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
-        self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.Hardswish()
-        
-        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
-        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
-
-    def forward(self, x):
-        identity = x
-        
-        n,c,h,w = x.size()
-        x_h = self.pool_h(x)
-        x_w = self.pool_w(x).permute(0, 1, 3, 2)
-
-        y = torch.cat([x_h, x_w], dim=2)
-        y = self.conv1(y)
-        y = self.bn1(y)
-        y = self.act(y) 
-        
-        x_h, x_w = torch.split(y, [h, w], dim=2)
-        x_w = x_w.permute(0, 1, 3, 2)
-
-        a_h = self.conv_h(x_h).sigmoid()
-        a_w = self.conv_w(x_w).sigmoid()
-
-        out = identity * a_h * a_w
-
-        return out
-
 class MultiPrototypes(nn.Module):
     def __init__(self, output_dim, nmb_prototypes):
         super(MultiPrototypes, self).__init__()
@@ -179,8 +142,9 @@ class SelectiveKernelFusion(nn.Module):
 class WTNet(nn.Module):
     def __init__(self, in_channels=3, input_size=[512, 512], semantic_dim=512, num_classes=0, 
                  output_dim=0, hidden_mlp=0, nmb_prototypes=0, eval_mode=False, normalize=False,
-                 use_attention=True, attn_heads=8, use_shared_stem=False, shared_stem_blocks=2,
-                 use_sk_fusion=False, pooling_type='gem', use_aux_heads=False):
+                 use_shared_stem=False, shared_stem_blocks=2,
+                 use_sk_fusion=False, pooling_type='gem', use_aux_heads=False,
+                 use_freq_pos_enc=False):
         super(WTNet, self).__init__()
         
         # SwAV specific params
@@ -188,16 +152,24 @@ class WTNet(nn.Module):
         self.l2norm = normalize
         self.num_classes = num_classes
         self.use_aux_heads = use_aux_heads
+        self.use_freq_pos_enc = use_freq_pos_enc
         
         # Network params
         self.in_channels = in_channels
         self.semantic_dim = semantic_dim
-        self.use_attention = use_attention
-        self.attn_heads = attn_heads
         self.use_shared_stem = use_shared_stem
         self.shared_stem_blocks = shared_stem_blocks
         self.use_sk_fusion = use_sk_fusion
         self.pooling_type = pooling_type
+        
+        # Frequency Positional Encoding
+        if self.use_freq_pos_enc:
+            # Assuming input_size[0] is the max frequency dimension
+            max_freq = input_size[0]
+            self.freq_pos_enc = nn.Parameter(torch.zeros(1, 1, max_freq, 1))
+            nn.init.normal_(self.freq_pos_enc, std=0.02)
+        else:
+            self.freq_pos_enc = None
         
         # If requested, create a shared stem to reduce repeated computation across branches.
         # The stem will execute the first `shared_stem_blocks` blocks once and then each
@@ -224,13 +196,6 @@ class WTNet(nn.Module):
             # 128 channels * 3 branches = 384
             self.feature_dim = 128 * 3
 
-        # Attention module (applied on concatenated feature map before pooling)
-        if self.use_attention:
-            # self.attn = MHSA2D(self.feature_dim, num_heads=self.attn_heads)
-            self.attn = CoordinateAttention(self.feature_dim, self.feature_dim)
-        else:
-            self.attn = None
-        
         # Pooling
         if self.pooling_type == 'mpn':
             self.pool = MPNCOV()
@@ -374,10 +339,19 @@ class WTNet(nn.Module):
         layers.append(nn.BatchNorm2d(out_c))
         layers.append(nn.ReLU())
         if pool:
-            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            layers.append(nn.MaxPool2d(kernel_size=1, stride=2))
         return layers
 
     def forward_backbone(self, x):
+        # Apply Frequency Positional Encoding if enabled
+        if self.use_freq_pos_enc and self.freq_pos_enc is not None:
+            # x: B, C, H, W
+            H = x.shape[2]
+            # Interpolate pos enc to match current H
+            # self.freq_pos_enc: 1, 1, max_H, 1
+            pos_enc = F.interpolate(self.freq_pos_enc, size=(H, 1), mode='bilinear', align_corners=False)
+            x = x + pos_enc
+
         # If we have a shared stem, run it once and feed the result to each branch.
         if getattr(self, 'shared_stem', None) is not None:
             shared = self.shared_stem(x)
@@ -402,10 +376,6 @@ class WTNet(nn.Module):
         else:
             out = torch.cat([e1, e3, e5], dim=1)  # [B, 128*3, H, W]
 
-        # optional attention on spatial features
-        if self.attn is not None:
-            out = self.attn(out)
-
         # Global Pooling
         # out = F.adaptive_avg_pool2d(out, (1, 1))
         out = self.pool(out)
@@ -425,7 +395,7 @@ class WTNet(nn.Module):
 
         if self.prototypes is not None:
             return x, self.prototypes(x)
-        return x
+        return x, None
 
     def forward(self, inputs, labels=None):
         if not isinstance(inputs, list):

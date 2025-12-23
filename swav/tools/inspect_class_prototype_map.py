@@ -48,7 +48,6 @@ def load_model(args):
         nmb_prototypes=args.nmb_prototypes,
         use_sk_fusion=False,
         pooling_type='gem',
-        use_attention=True,
     )
 
     

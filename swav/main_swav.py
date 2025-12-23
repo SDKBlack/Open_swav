@@ -145,6 +145,7 @@ parser.add_argument("--boundary_warmup_epochs", type=int, default=0, help="numbe
 parser.add_argument("--boundary_pos_start", type=float, default=None, help="starting positive threshold for boundary loss (will anneal to boundary_pos_thresh)")
 parser.add_argument("--boundary_pos_anneal_epochs", type=int, default=0, help="number of epochs over which to linearly anneal boundary_pos from start to target (0 disables annealing)")
 parser.add_argument("--use_specaugment", type=bool_flag, default=False, help="Use SpecAugment (time+freq masking) instead of RandomErasing for spectrogram data")
+parser.add_argument("--use_freq_pos_enc", type=bool_flag, default=False, help="Use learnable frequency positional encoding")
 parser.add_argument("--spec_freq_masks", type=int, default=2, help="number of frequency masks to apply")
 parser.add_argument("--spec_time_masks", type=int, default=2, help="number of time masks to apply")
 parser.add_argument("--spec_max_freq", type=int, default=30, help="maximum width (in bins) for a frequency mask")
@@ -234,6 +235,7 @@ def main():
             use_sk_fusion=args.use_sk_fusion,
             pooling_type=args.pooling_type,
             use_aux_heads=args.use_aux_heads,
+            use_freq_pos_enc=args.use_freq_pos_enc,
         )
     else:
         model = resnet_models.__dict__[args.arch](
