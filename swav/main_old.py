@@ -19,13 +19,9 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
-try:
-    import apex
-    from apex.parallel.LARC import LARC
-except ImportError:
-    apex = None
-    LARC = None
-# from src.larc import LARC
+# import apex
+# from apex.parallel.LARC import LARC
+from src.larc import LARC
 from src.boundary_loss import BoundaryLoss
 
 from src.utils import (
@@ -144,14 +140,8 @@ parser.add_argument("--boundary_loss_weight", type=float, default=0.1, help="wei
 parser.add_argument("--boundary_warmup_epochs", type=int, default=0, help="number of epochs to wait before enabling boundary loss")
 parser.add_argument("--boundary_pos_start", type=float, default=None, help="starting positive threshold for boundary loss (will anneal to boundary_pos_thresh)")
 parser.add_argument("--boundary_pos_anneal_epochs", type=int, default=0, help="number of epochs over which to linearly anneal boundary_pos from start to target (0 disables annealing)")
-parser.add_argument("--use_specaugment", type=bool_flag, default=False, help="Use SpecAugment (time+freq masking) instead of RandomErasing for spectrogram data")
-parser.add_argument("--spec_freq_masks", type=int, default=2, help="number of frequency masks to apply")
-parser.add_argument("--spec_time_masks", type=int, default=2, help="number of time masks to apply")
-parser.add_argument("--spec_max_freq", type=int, default=30, help="maximum width (in bins) for a frequency mask")
-parser.add_argument("--spec_max_time", type=int, default=40, help="maximum width (in frames) for a time mask")
+parser.add_argument("--random_erasing_prob", type=float, default=0.3, help="probability of random erasing")
 parser.add_argument("--tb_log_interval", type=int, default=50, help="TensorBoard logging interval in iterations (only on rank 0)")
-parser.add_argument("--use_mixup", type=bool_flag, default=False, help="Use mixup for virtual unknowns")
-parser.add_argument("--mixup_loss_weight", type=float, default=1, help="Weight for mixup loss")
 
 #########################
 #### WTNet specific params
@@ -192,12 +182,7 @@ def main():
             args.min_scale_crops,
             args.max_scale_crops,
             is_train=True,
-            # SpecAugment params
-            use_specaugment=args.use_specaugment,
-            spec_freq_masks=args.spec_freq_masks,
-            spec_time_masks=args.spec_time_masks,
-            spec_max_freq=args.spec_max_freq,
-            spec_max_time=args.spec_max_time,
+            random_erasing_prob=args.random_erasing_prob,
         )
         if args.num_classes == 0:
             args.num_classes = train_dataset.num_classes
@@ -299,10 +284,7 @@ def main():
         momentum=0.9,
         weight_decay=args.wd,
     )
-    if LARC is not None:
-        optimizer = LARC(optimizer=optimizer, trust_coefficient=0.001, clip=False)
-    else:
-        logger.warning("NVIDIA Apex LARC not found. Training without LARC.")
+    optimizer = LARC(optimizer=optimizer, trust_coefficient=0.001, clip=False)
     warmup_lr_schedule = np.linspace(args.start_warmup, args.base_lr, len(train_loader) * args.warmup_epochs)
     iters = np.arange(len(train_loader) * (args.epochs - args.warmup_epochs))
     cosine_lr_schedule = np.array([args.final_lr + 0.5 * (args.base_lr - args.final_lr) * (1 + \
@@ -456,9 +438,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
-    swav_losses = AverageMeter()
     boundary_losses = AverageMeter()
-    mixup_losses = AverageMeter()
 
     ce_losses = AverageMeter()
     aux_losses = AverageMeter()
@@ -563,32 +543,21 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             loss += subloss / (np.sum(args.nmb_crops) - 1)
             
         loss /= len(args.crops_for_assign)
-        # Track raw (unweighted) SwAV loss
-        try:
-            swav_losses.update(float(loss.item()), bs)
-        except Exception:
-            swav_losses.update(float(loss), bs)
 
         # ============ CE loss ... ============
         ce_loss = 0
         if logits is not None and labels is not None:
             ce_loss = nn.CrossEntropyLoss()(logits[:bs], labels)
             ce_losses.update(ce_loss.item(), bs)
-        else:
-            ce_losses.update(0.0, bs)
 
         # ============ Aux loss ... ============
         if aux_logits is not None and labels is not None:
             for k, v in aux_logits.items():
                 aux_loss += nn.CrossEntropyLoss()(v[:bs], labels)
             aux_losses.update(aux_loss.item(), bs)
-        else:
-            aux_losses.update(0.0, bs)
             
         # ============ Boundary Loss ... ============
         boundary_loss = 0
-        boundary_loss_raw = 0
-        mixup_loss_raw = 0
         # Compute current positive threshold (possibly annealed). If annealing is
         # disabled (boundary_pos_anneal_epochs == 0), this will simply be
         # args.boundary_pos_thresh. We update the criterion's pos_thresh so the
@@ -621,37 +590,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 n_crops = backbone_feats.size(0) // bs
                 labels_expanded = labels.repeat(n_crops)
                 
-                # Raw (unweighted) boundary loss
-                boundary_loss_raw = boundary_criterion(backbone_feats, labels_expanded)
-                # Weight meters by number of backbone features (often B * n_crops)
-                n_feats = int(backbone_feats.size(0))
-                boundary_losses.update(float(boundary_loss_raw.item()), n_feats)
-
-                # Start from raw boundary loss; mixup term (if enabled) is added separately
-                boundary_loss = boundary_loss_raw
-
-                # ============ Mixup for Virtual Unknowns ... ============
-                if args.use_mixup:
-                    # 1. Random Mixup
-                    lam = np.random.beta(1.0, 1.0)
-                    batch_size_feats = backbone_feats.size(0)
-                    index = torch.randperm(batch_size_feats).cuda()
-                    virtual_unknowns = lam * backbone_feats + (1 - lam) * backbone_feats[index]
-
-                    # 2. & 3. Calculate distance to prototypes and force > neg_thresh
-                    mixup_loss_raw = boundary_criterion.forward_virtual(virtual_unknowns)
-                    mixup_losses.update(float(mixup_loss_raw.item()), n_feats)
-                    boundary_loss += args.mixup_loss_weight * mixup_loss_raw
-                else:
-                    mixup_losses.update(0.0, n_feats)
-            else:
-                # boundary enabled but backbone feats missing
-                boundary_losses.update(0.0, bs)
-                mixup_losses.update(0.0, bs)
-        else:
-            # boundary disabled / no labels / warmup not reached
-            boundary_losses.update(0.0, bs)
-            mixup_losses.update(0.0, bs)
+                boundary_loss = boundary_criterion(backbone_feats, labels_expanded)
+                boundary_losses.update(boundary_loss.item(), bs)
         
         total_loss = args.swav_weight * loss + ce_loss + args.boundary_loss_weight * boundary_loss + args.aux_loss_weight * aux_loss
 
@@ -680,29 +620,24 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         batch_time.update(time.time() - end)
         end = time.time()
         if args.rank == 0 and it % args.tb_log_interval == 0:
-            lr_val = optimizer.optimizer.param_groups[0]["lr"] if hasattr(optimizer, "optimizer") else optimizer.param_groups[0]["lr"]
             logger.info(
                 "Epoch: [{0}][{1}]\t"
                 "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
                 "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                    "Total Loss {tot.val:.4f} ({tot.avg:.4f})\t"
-                    "SWAV Loss {swav.val:.4f} ({swav.avg:.4f})\t"
+                    "SWAV Loss {loss.val:.4f} ({loss.avg:.4f})\t"
                     "CE Loss {ce_loss.val:.4f} ({ce_loss.avg:.4f})\t"
                     "Aux Loss {aux_loss.val:.4f} ({aux_loss.avg:.4f})\t"
                     "B Loss {b_loss.val:.4f} ({b_loss.avg:.4f})\t"
-                    "Mixup Loss {m_loss.val:.4f} ({m_loss.avg:.4f})\t"
                 "Lr: {lr:.4f}".format(
                     epoch,
                     it,
                     batch_time=batch_time,
                     data_time=data_time,
-                    tot=losses,
-                    swav=swav_losses,
+                    loss=losses,
                     ce_loss=ce_losses,
                         aux_loss=aux_losses,
                         b_loss=boundary_losses,
-                        m_loss=mixup_losses,
-                    lr=lr_val,
+                    lr=optimizer.optimizer.param_groups[0]["lr"],
                 )
             )
 
@@ -729,16 +664,6 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                         tb.add_scalar('train/boundary_loss_iter', float(boundary_loss.item()), global_step)
                     except Exception:
                         tb.add_scalar('train/boundary_loss_iter', float(boundary_loss), global_step)
-                    # boundary raw (unweighted)
-                    try:
-                        tb.add_scalar('train/boundary_loss_raw_iter', float(boundary_loss_raw.item()), global_step)
-                    except Exception:
-                        tb.add_scalar('train/boundary_loss_raw_iter', float(boundary_loss_raw), global_step)
-                    # mixup raw (unweighted)
-                    try:
-                        tb.add_scalar('train/mixup_loss_raw_iter', float(mixup_loss_raw.item()), global_step)
-                    except Exception:
-                        tb.add_scalar('train/mixup_loss_raw_iter', float(mixup_loss_raw), global_step)
                     # aux loss
                     try:
                         tb.add_scalar('train/aux_loss_iter', float(aux_loss.item()), global_step)
@@ -768,11 +693,9 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         tb = getattr(logger, 'tb_writer', None)
         if tb is not None and args.rank == 0:
             tb.add_scalar('train/total_loss_epoch', float(losses.avg), epoch)
-            tb.add_scalar('train/swav_loss_epoch', float(swav_losses.avg), epoch)
             tb.add_scalar('train/ce_loss_epoch', float(ce_losses.avg), epoch)
             tb.add_scalar('train/aux_loss_epoch', float(aux_losses.avg), epoch)
-            tb.add_scalar('train/boundary_loss_raw_epoch', float(boundary_losses.avg), epoch)
-            tb.add_scalar('train/mixup_loss_raw_epoch', float(mixup_losses.avg), epoch)
+            tb.add_scalar('train/boundary_loss_epoch', float(boundary_losses.avg), epoch)
             # record lr at epoch end (first param group)
             try:
                 try:
@@ -845,4 +768,4 @@ if __name__ == "__main__":
     main()
 
 
-# torchrun --nproc_per_node=1 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.4   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_mixup_pro90   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 90 --use_mixup True --use_aux_heads True --mixup_loss_weight 10
+# torchrun --nproc_per_node=2 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.4   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_wtnet_m0.9_sk_mpn_pro72_sl0.1   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 72

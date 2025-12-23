@@ -37,7 +37,7 @@ def outlier_check(distance_list):
 def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
     if metrics is None or KMeans is None or MinMaxScaler is None:
         logger.info("Stage 2 UP: Sklearn components not available.")
-        return 0.0
+        return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
 
     # Prepare data
     test_X_np = test_X.numpy() if isinstance(test_X, torch.Tensor) else test_X
@@ -51,7 +51,7 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
     unknown_mask = (label_hat == -1)
     if np.sum(unknown_mask) == 0:
         logger.info("Stage 2 UP: No samples predicted as unknown.")
-        return 0.0
+        return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
 
     predict_unknown_X = test_X_np[unknown_mask]
     predict_unknown_Y = test_Y_np[unknown_mask]
@@ -80,7 +80,7 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
             a = np.sum(test_Y_normalized[unknown_mask] == -1)
             c = predict_unknown_X.shape[0]
             up = a / c if c > 0 else 0.0
-            return up
+            return {'up_db': up, 'up_sil': up, 'up_kmeans': up}
     except Exception as e:
         logger.info(f"Stage 2 UP: u=1 check failed ({e}), proceeding to clustering.")
 
@@ -89,7 +89,9 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
         scaler = MinMaxScaler()
         predict_unknown_X_scaled = scaler.fit_transform(predict_unknown_X)
         
-        scores = []
+        db_scores = []
+        sil_scores = []
+        
         # Search for best k
         k_min = 2
         k_max = 15
@@ -105,63 +107,73 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
             kmeans = KMeans(n_clusters=ui, init='k-means++', random_state=51).fit(predict_unknown_X_scaled)
             pre_label = kmeans.labels_
             if len(np.unique(pre_label)) > 1:
-                # Use Silhouette Score (Higher is better) instead of Davies-Bouldin
-                score = metrics.silhouette_score(predict_unknown_X_scaled, pre_label)
+                # Davies-Bouldin (Lower is better)
+                db = metrics.davies_bouldin_score(predict_unknown_X_scaled, pre_label)
+                # Silhouette Score (Higher is better)
+                sil = metrics.silhouette_score(predict_unknown_X_scaled, pre_label)
             else:
-                score = -1.0
-            scores.append(score)
+                db = float('inf')
+                sil = -1.0
+            db_scores.append(db)
+            sil_scores.append(sil)
             
-        if not scores:
-             logger.info("Stage 2 UP: Clustering failed (not enough samples/clusters).")
-             return 0.0
+        if not db_scores:
+            logger.info("Stage 2 UP: Clustering failed (not enough samples/clusters).")
+            return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
 
-        # Select k with maximum Silhouette Score
-        u = candidates[np.argmax(scores)]
-        logger.info(f"Stage 2 UP: Selected u={u} (using Silhouette Score)")
+        # Select k
+        u_db = candidates[np.argmin(db_scores)]
+        u_sil = candidates[np.argmax(sil_scores)]
         
-        # Final clustering with selected u
-        kmeans = KMeans(n_clusters=u, init='k-means++', random_state=51).fit(predict_unknown_X_scaled)
-        pred_label = kmeans.labels_
+        logger.info(f"Stage 2 UP: Selected u_db={u_db} (DB Score), u_sil={u_sil} (Silhouette Score)")
         
-        # Confusion Matrix: rows=clusters, cols=classes (known + unknown)
-        # We need to map predict_unknown_Y (original labels) to columns
-        # predict_unknown_Y contains labels from 0 to num_known + num_unknown - 1
-        
-        # Ensure confusion matrix is large enough
-        total_classes = num_known + num_unknown
-        confusion_mat = np.zeros((u, total_classes))
-        
-        for xi in range(predict_unknown_X.shape[0]):
-            true_label = int(predict_unknown_Y[xi])
-            cluster_label = int(pred_label[xi])
-            if true_label < total_classes:
-                confusion_mat[cluster_label][true_label] += 1
-                
-        # Slice to keep only unknown classes columns
-        confusion_mat_unknown = confusion_mat[:, num_known:]
-        
-        dominate_sample = np.zeros(num_unknown)
-        for row in range(u):
-            for col in range(num_unknown):
-                # Condition: 
-                # 1. Samples of class 'col' in cluster 'row' >= 50% of total samples in cluster 'row' (considering only unknown columns?)
-                # The reference code: np.sum(confusion_mat[row]) where confusion_mat is ALREADY sliced.
-                # So yes, it checks if the class dominates the *unknown part* of the cluster?
-                # Wait, reference: confusion_mat = confusion_mat[:, num_known:] -> then np.sum(confusion_mat[row])
-                
-                cluster_total_unknowns = np.sum(confusion_mat_unknown[row])
-                if cluster_total_unknowns > 0:
-                    if confusion_mat_unknown[row][col] >= cluster_total_unknowns * 0.5:
-                        # Check if this cluster is the one with max samples for this class
-                        if np.argmax(confusion_mat_unknown[:, col]) == row:
-                            dominate_sample[col] = confusion_mat_unknown[row][col]
-                            
-        up = np.sum(dominate_sample) / predict_unknown_X.shape[0]
-        return up
+        def calculate_up_for_k(k_val):
+            # Final clustering with selected u
+            kmeans = KMeans(n_clusters=k_val, init='k-means++', random_state=51).fit(predict_unknown_X_scaled)
+            pred_label = kmeans.labels_
+            
+            # Confusion Matrix: rows=clusters, cols=classes (known + unknown)
+            total_classes = num_known + num_unknown
+            confusion_mat = np.zeros((k_val, total_classes))
+            
+            for xi in range(predict_unknown_X.shape[0]):
+                true_label = int(predict_unknown_Y[xi])
+                cluster_label = int(pred_label[xi])
+                if true_label < total_classes:
+                    confusion_mat[cluster_label][true_label] += 1
+                    
+            # Slice to keep only unknown classes columns
+            confusion_mat_unknown = confusion_mat[:, num_known:]
+            
+            dominate_sample = np.zeros(num_unknown)
+            for row in range(k_val):
+                for col in range(num_unknown):
+                    cluster_total_unknowns = np.sum(confusion_mat_unknown[row])
+                    if cluster_total_unknowns > 0:
+                        if confusion_mat_unknown[row][col] >= cluster_total_unknowns * 0.5:
+                            # Check if this cluster is the one with max samples for this class
+                            if np.argmax(confusion_mat_unknown[:, col]) == row:
+                                dominate_sample[col] = confusion_mat_unknown[row][col]
+                                
+            return np.sum(dominate_sample) / predict_unknown_X.shape[0]
+
+        up_db = calculate_up_for_k(u_db)
+        up_sil = calculate_up_for_k(u_sil)
+
+        # KMeans method: use k = num_unknown (fallback to 2), capped by sample count
+        n_samples = predict_unknown_X_scaled.shape[0]
+        k_kmeans = num_unknown if num_unknown >= 2 else 2
+        k_kmeans = min(k_kmeans, max(2, n_samples))
+        if k_kmeans < 2 or n_samples < 2:
+            up_kmeans = 0.0
+        else:
+            up_kmeans = calculate_up_for_k(int(k_kmeans))
+
+        return {'up_db': up_db, 'up_sil': up_sil, 'up_kmeans': up_kmeans}
 
     except Exception as e:
         logger.info(f"Stage 2 UP: Clustering logic failed ({e})")
-        return 0.0
+        return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
 
 def metrics_stage_1(true_label, predict_label, num_known):
     num_samples = predict_label.shape[0]
@@ -537,13 +549,23 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
 
 
     # --- Stage 2 UP (Clustering-based) for Euclidean ---
+    stage2_up_eu_db = None
+    stage2_up_eu_sil = None
+    stage2_up_eu_kmeans = None
     try:
         logger.info("Computing Stage 2 UP (Euclidean)...")
-        stage2_up_eu = compute_stage2_up(test_X, test_Y, label_hat_eu, theta_eu, num_known)
-        logger.info(f"Stage 2 UP (Euclidean): {stage2_up_eu:.4f}")
+        res = compute_stage2_up(test_X, test_Y, label_hat_eu, theta_eu, num_known)
+        stage2_up_eu_db = res['up_db']
+        stage2_up_eu_sil = res['up_sil']
+        stage2_up_eu_kmeans = res.get('up_kmeans', None)
+        logger.info(f"Stage 2 UP (Euclidean) [DB]: {stage2_up_eu_db:.4f}")
+        logger.info(f"Stage 2 UP (Euclidean) [Silhouette]: {stage2_up_eu_sil:.4f}")
+        if stage2_up_eu_kmeans is not None:
+            logger.info(f"Stage 2 UP (Euclidean) [KMeans]: {stage2_up_eu_kmeans:.4f}")
+        else:
+            logger.info("Stage 2 UP (Euclidean) [KMeans]: None")
     except Exception as e:
         logger.info(f"Stage 2 UP (Euclidean): failed ({e})")
-        stage2_up_eu = None
 
     # 4. Evaluate Mahalanobis Distance
     logger.info("Evaluating with Mahalanobis Distance...")
@@ -561,13 +583,23 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
 
 
     # --- Stage 2 UP (Clustering-based) for Mahalanobis ---
+    stage2_up_mahal_db = None
+    stage2_up_mahal_sil = None
+    stage2_up_mahal_kmeans = None
     try:
         logger.info("Computing Stage 2 UP (Mahalanobis)...")
-        stage2_up_mahal = compute_stage2_up(test_X, test_Y, label_hat_mahal, theta_mahal, num_known)
-        logger.info(f"Stage 2 UP (Mahalanobis): {stage2_up_mahal:.4f}")
+        res = compute_stage2_up(test_X, test_Y, label_hat_mahal, theta_mahal, num_known)
+        stage2_up_mahal_db = res['up_db']
+        stage2_up_mahal_sil = res['up_sil']
+        stage2_up_mahal_kmeans = res.get('up_kmeans', None)
+        logger.info(f"Stage 2 UP (Mahalanobis) [DB]: {stage2_up_mahal_db:.4f}")
+        logger.info(f"Stage 2 UP (Mahalanobis) [Silhouette]: {stage2_up_mahal_sil:.4f}")
+        if stage2_up_mahal_kmeans is not None:
+            logger.info(f"Stage 2 UP (Mahalanobis) [KMeans]: {stage2_up_mahal_kmeans:.4f}")
+        else:
+            logger.info("Stage 2 UP (Mahalanobis) [KMeans]: None")
     except Exception as e:
         logger.info(f"Stage 2 UP (Mahalanobis): failed ({e})")
-        stage2_up_mahal = None
 
     # --- Consistency Check Strategy ---
     if test_aux_logits_list:
@@ -600,13 +632,23 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
         logger.info(f"Mean Known Accuracy: {np.mean(accuracy_cc):.4f}")
         
         # Stage 2 UP for Consistency Check (Euclidean)
+        stage2_up_cc_db = None
+        stage2_up_cc_sil = None
+        stage2_up_cc_kmeans = None
         try:
             logger.info("Computing Stage 2 UP (Consistency - Euclidean)...")
-            stage2_up_cc = compute_stage2_up(test_X, test_Y, refined_label_hat, theta_eu, num_known)
-            logger.info(f"Stage 2 UP (Consistency - Euclidean): {stage2_up_cc:.4f}")
+            res = compute_stage2_up(test_X, test_Y, refined_label_hat, theta_eu, num_known)
+            stage2_up_cc_db = res['up_db']
+            stage2_up_cc_sil = res['up_sil']
+            stage2_up_cc_kmeans = res.get('up_kmeans', None)
+            logger.info(f"Stage 2 UP (Consistency - Euclidean) [DB]: {stage2_up_cc_db:.4f}")
+            logger.info(f"Stage 2 UP (Consistency - Euclidean) [Silhouette]: {stage2_up_cc_sil:.4f}")
+            if stage2_up_cc_kmeans is not None:
+                logger.info(f"Stage 2 UP (Consistency - Euclidean) [KMeans]: {stage2_up_cc_kmeans:.4f}")
+            else:
+                logger.info("Stage 2 UP (Consistency - Euclidean) [KMeans]: None")
         except Exception as e:
             logger.info(f"Stage 2 UP (Consistency - Euclidean): failed ({e})")
-            stage2_up_cc = None
 
         # Apply consistency for Mahalanobis
         refined_label_hat_mahal = label_hat_mahal.copy()
@@ -622,23 +664,41 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
         logger.info(f"Mean Known Accuracy: {np.mean(accuracy_cc_m):.4f}")
         
         # Stage 2 UP for Consistency Check (Mahalanobis)
+        stage2_up_cc_m_db = None
+        stage2_up_cc_m_sil = None
+        stage2_up_cc_m_kmeans = None
         try:
             logger.info("Computing Stage 2 UP (Consistency - Mahalanobis)...")
-            stage2_up_cc_m = compute_stage2_up(test_X, test_Y, refined_label_hat_mahal, theta_mahal, num_known)
-            logger.info(f"Stage 2 UP (Consistency - Mahalanobis): {stage2_up_cc_m:.4f}")
+            res = compute_stage2_up(test_X, test_Y, refined_label_hat_mahal, theta_mahal, num_known)
+            stage2_up_cc_m_db = res['up_db']
+            stage2_up_cc_m_sil = res['up_sil']
+            stage2_up_cc_m_kmeans = res.get('up_kmeans', None)
+            logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [DB]: {stage2_up_cc_m_db:.4f}")
+            logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [Silhouette]: {stage2_up_cc_m_sil:.4f}")
+            if stage2_up_cc_m_kmeans is not None:
+                logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [KMeans]: {stage2_up_cc_m_kmeans:.4f}")
+            else:
+                logger.info("Stage 2 UP (Consistency - Mahalanobis) [KMeans]: None")
         except Exception as e:
             logger.info(f"Stage 2 UP (Consistency - Mahalanobis): failed ({e})")
-            stage2_up_cc_m = None
 
     # 5. Return combined results
     results = {
         'tkr_eu': tkr_eu, 'tur_eu': tur_eu, 'kp_eu': kp_eu, 'fkr_eu': fkr_eu, 'mean_acc_eu': mean_acc_eu,
         'tkr_mahal': tkr_mahal, 'tur_mahal': tur_mahal, 'kp_mahal': kp_mahal, 'fkr_mahal': fkr_mahal, 'mean_acc_mahal': mean_acc_mahal,
         'label_hat_eu': label_hat_eu, 'label_hat_mahal': label_hat_mahal,
-        'stage2_up_eu': stage2_up_eu if 'stage2_up_eu' in locals() else None,
-        'stage2_up_mahal': stage2_up_mahal if 'stage2_up_mahal' in locals() else None,
-        'stage2_up_cc': stage2_up_cc if 'stage2_up_cc' in locals() else None,
-        'stage2_up_cc_m': stage2_up_cc_m if 'stage2_up_cc_m' in locals() else None
+    'stage2_up_eu_db': stage2_up_eu_db if 'stage2_up_eu_db' in locals() else None,
+    'stage2_up_eu_sil': stage2_up_eu_sil if 'stage2_up_eu_sil' in locals() else None,
+    'stage2_up_eu_kmeans': stage2_up_eu_kmeans if 'stage2_up_eu_kmeans' in locals() else None,
+    'stage2_up_mahal_db': stage2_up_mahal_db if 'stage2_up_mahal_db' in locals() else None,
+    'stage2_up_mahal_sil': stage2_up_mahal_sil if 'stage2_up_mahal_sil' in locals() else None,
+    'stage2_up_mahal_kmeans': stage2_up_mahal_kmeans if 'stage2_up_mahal_kmeans' in locals() else None,
+        'stage2_up_cc_db': stage2_up_cc_db if 'stage2_up_cc_db' in locals() else None,
+        'stage2_up_cc_sil': stage2_up_cc_sil if 'stage2_up_cc_sil' in locals() else None,
+        'stage2_up_cc_kmeans': stage2_up_cc_kmeans if 'stage2_up_cc_kmeans' in locals() else None,
+        'stage2_up_cc_m_db': stage2_up_cc_m_db if 'stage2_up_cc_m_db' in locals() else None,
+        'stage2_up_cc_m_sil': stage2_up_cc_m_sil if 'stage2_up_cc_m_sil' in locals() else None,
+        'stage2_up_cc_m_kmeans': stage2_up_cc_m_kmeans if 'stage2_up_cc_m_kmeans' in locals() else None
     }
     
     return results

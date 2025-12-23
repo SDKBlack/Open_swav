@@ -71,7 +71,7 @@ class MultiPrototypes(nn.Module):
         return out
 
 class ArcFaceClassifier(nn.Module):
-    def __init__(self, in_features, num_classes, s=30.0, m=0.9):
+    def __init__(self, in_features, num_classes, s=30.0, m=0.7):
         super(ArcFaceClassifier, self).__init__()
         self.in_features = in_features
         self.num_classes = num_classes
@@ -177,7 +177,7 @@ class SelectiveKernelFusion(nn.Module):
         return V
 
 class WTNet(nn.Module):
-    def __init__(self, in_channels=3, input_size=[512, 512], semantic_dim=128, num_classes=0, 
+    def __init__(self, in_channels=3, input_size=[512, 512], semantic_dim=512, num_classes=0, 
                  output_dim=0, hidden_mlp=0, nmb_prototypes=0, eval_mode=False, normalize=False,
                  use_attention=True, attn_heads=8, use_shared_stem=False, shared_stem_blocks=2,
                  use_sk_fusion=False, pooling_type='gem', use_aux_heads=False):
