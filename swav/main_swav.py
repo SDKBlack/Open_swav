@@ -75,6 +75,8 @@ parser.add_argument("--feat_dim", default=128, type=int,
                     help="feature dimension")
 parser.add_argument("--nmb_prototypes", default=36, type=int,
                     help="number of prototypes")
+parser.add_argument("--n_active_prototypes", default=0, type=int,
+                    help="(optional) number of active prototypes to use for SwAV assignments; if 0, fallback to num_classes or heuristic")
 parser.add_argument("--queue_length", type=int, default=8096,
                     help="length of the queue (0 for no queue)")
 parser.add_argument("--epoch_queue_starts", type=int, default=15,
@@ -544,9 +546,12 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         aux_loss = 0
         
         # === 新增：定义活跃原型的数量 ===
-        # 假设前 num_classes 个原型是给已知类的，剩下的是幽灵原型
-        # 如果 args.num_classes 没有设置，您可能需要手动指定，或者用 args.nmb_prototypes 的一部分
-        n_active = args.num_classes if args.num_classes > 0 else 18 
+        # 优先使用用户手动指定的 args.n_active_prototypes（若 >0）
+        if hasattr(args, 'n_active_prototypes') and args.n_active_prototypes > 0:
+            n_active = args.n_active_prototypes
+        else:
+            # 否则回退到 num_classes（如果设置了），再回退到一个默认值（18）
+            n_active = args.num_classes if args.num_classes > 0 else 18
         # 确保不超过总原型数
         n_active = min(n_active, args.nmb_prototypes)
         
