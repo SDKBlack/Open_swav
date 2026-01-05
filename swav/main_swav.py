@@ -224,6 +224,9 @@ def main():
 
     # build model
     if args.arch == 'wtnet':
+        # Determine max input size for frequency pos encoding
+        max_input_size = max(args.size_crops) if args.size_crops else 224
+        
         model = WTNet(
             normalize=True,
             hidden_mlp=args.hidden_mlp,
@@ -236,6 +239,7 @@ def main():
             pooling_type=args.pooling_type,
             use_aux_heads=args.use_aux_heads,
             use_freq_pos_enc=args.use_freq_pos_enc,
+            input_size=[max_input_size, max_input_size],
         )
     else:
         model = resnet_models.__dict__[args.arch](
@@ -847,4 +851,4 @@ if __name__ == "__main__":
     main()
 
 
-# torchrun --nproc_per_node=1 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.4   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_mixup_pro90   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 90 --use_mixup True --use_aux_heads True --mixup_loss_weight 10
+# torchrun --nproc_per_node=1 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.1   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_enc   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 90   --use_aux_heads True   --aux_loss_weight 0.1  --use_freq_pos_enc true

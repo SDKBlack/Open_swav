@@ -74,13 +74,13 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
         theta_max = np.max(theta) if isinstance(theta, np.ndarray) else theta.max().item()
         
         if theta_u1 <= theta_max:
-            logger.info("Stage 2 UP: u=1 detected.")
+            logger.info("Stage 2 UP: u=1 detected (Compact). Proceeding to clustering to find substructure.")
             # Calculate UP (Precision of Unknowns)
             # a: number of true unknowns in predicted unknowns
-            a = np.sum(test_Y_normalized[unknown_mask] == -1)
-            c = predict_unknown_X.shape[0]
-            up = a / c if c > 0 else 0.0
-            return {'up_db': up, 'up_sil': up, 'up_kmeans': up}
+            # a = np.sum(test_Y_normalized[unknown_mask] == -1)
+            # c = predict_unknown_X.shape[0]
+            # up = a / c if c > 0 else 0.0
+            # return {'up_db': up, 'up_sil': up, 'up_kmeans': up}
     except Exception as e:
         logger.info(f"Stage 2 UP: u=1 check failed ({e}), proceeding to clustering.")
 
@@ -288,7 +288,7 @@ def plot_tsne(test_X, test_Y, num_known, dump_path):
     unknown_mask = test_Y_np >= num_known
     
     # Helper for plotting
-    def plot_scatter(x, y, labels, title, filename, cmap='tab20', alpha=0.7, show_legend=True):
+    def plot_scatter(x, y, labels, title, filename, cmap='tab20', alpha=0.7, show_legend=True, label_map=None):
         plt.figure(figsize=(12, 10))
         scatter = plt.scatter(x, y, c=labels, cmap=cmap, s=20, alpha=alpha)
         if show_legend:
@@ -300,7 +300,11 @@ def plot_tsne(test_X, test_Y, num_known, dump_path):
                 if unique_labels.shape[0] == 1:
                     # Single label -> single legend entry
                     color = cmap_obj(0.5)
-                    handles.append(Line2D([0], [0], marker='o', color='w', label=str(unique_labels[0]),
+                    lab = unique_labels[0]
+                    label_text = str(lab)
+                    if label_map and lab in label_map:
+                        label_text = label_map[lab]
+                    handles.append(Line2D([0], [0], marker='o', color='w', label=label_text,
                                           markerfacecolor=color, markersize=8))
                 else:
                     # Map each unique label to a distinct color from the colormap
@@ -309,7 +313,10 @@ def plot_tsne(test_X, test_Y, num_known, dump_path):
                         # normalize index to [0,1]
                         idx = 0 if n == 1 else float(i) / (n - 1)
                         color = cmap_obj(idx)
-                        handles.append(Line2D([0], [0], marker='o', color='w', label=str(lab),
+                        label_text = str(lab)
+                        if label_map and lab in label_map:
+                            label_text = label_map[lab]
+                        handles.append(Line2D([0], [0], marker='o', color='w', label=label_text,
                                               markerfacecolor=color, markersize=6))
                 plt.legend(handles=handles, fontsize=10, title='Class ID')
             except Exception:
@@ -322,7 +329,11 @@ def plot_tsne(test_X, test_Y, num_known, dump_path):
         plt.close()
 
     # Plot all
-    plot_scatter(X_embedded[:, 0], X_embedded[:, 1], test_Y_np, "t-SNE (All Classes)", "tsne_all.png")
+    # Merge all unknown classes into one label for visualization
+    test_Y_merged = test_Y_np.copy()
+    test_Y_merged[test_Y_merged >= num_known] = num_known
+    
+    plot_scatter(X_embedded[:, 0], X_embedded[:, 1], test_Y_merged, "t-SNE (All Classes)", "tsne_all.png", label_map={num_known: 'Unknown'})
     
     # Plot Known only
     if np.sum(known_mask) > 0:

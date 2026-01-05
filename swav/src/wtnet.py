@@ -34,7 +34,7 @@ class MultiPrototypes(nn.Module):
         return out
 
 class ArcFaceClassifier(nn.Module):
-    def __init__(self, in_features, num_classes, s=30.0, m=0.7):
+    def __init__(self, in_features, num_classes, s=20.0, m=0.5):
         super(ArcFaceClassifier, self).__init__()
         self.in_features = in_features
         self.num_classes = num_classes
@@ -153,6 +153,7 @@ class WTNet(nn.Module):
         self.num_classes = num_classes
         self.use_aux_heads = use_aux_heads
         self.use_freq_pos_enc = use_freq_pos_enc
+        self.input_size = input_size
         
         # Network params
         self.in_channels = in_channels
@@ -166,10 +167,16 @@ class WTNet(nn.Module):
         if self.use_freq_pos_enc:
             # Assuming input_size[0] is the max frequency dimension
             max_freq = input_size[0]
-            self.freq_pos_enc = nn.Parameter(torch.zeros(1, 1, max_freq, 1))
-            nn.init.normal_(self.freq_pos_enc, std=0.02)
+            self.pos_branch = nn.Sequential(
+                nn.Linear(max_freq, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Linear(128, 64)
+            )
+            self.pos_dim = 64
         else:
-            self.freq_pos_enc = None
+            self.pos_branch = None
+            self.pos_dim = 0
         
         # If requested, create a shared stem to reduce repeated computation across branches.
         # The stem will execute the first `shared_stem_blocks` blocks once and then each
@@ -262,9 +269,9 @@ class WTNet(nn.Module):
         if output_dim == 0:
             self.projection_head = None
         elif hidden_mlp == 0:
-            self.projection_head = nn.Linear(self.semantic_dim, output_dim)
+            self.projection_head = nn.Linear(self.semantic_dim + self.pos_dim, output_dim)
         else:
-            self.projection_head = nn.Linear(self.semantic_dim, output_dim)
+            self.projection_head = nn.Linear(self.semantic_dim + self.pos_dim, output_dim)
             # self.projection_head = nn.Sequential(
             #     nn.Linear(self.semantic_dim, hidden_mlp),
             #     nn.BatchNorm1d(hidden_mlp),
@@ -282,7 +289,7 @@ class WTNet(nn.Module):
         # Classifier (optional)
         if num_classes > 0:
             # self.classifier = CosineClassifier(self.semantic_dim, num_classes)
-            self.classifier = ArcFaceClassifier(self.semantic_dim, num_classes)
+            self.classifier = ArcFaceClassifier(self.semantic_dim + self.pos_dim, num_classes)
         else:
             self.classifier = None
 
@@ -343,14 +350,20 @@ class WTNet(nn.Module):
         return layers
 
     def forward_backbone(self, x):
-        # Apply Frequency Positional Encoding if enabled
-        if self.use_freq_pos_enc and self.freq_pos_enc is not None:
+        # Position Branch
+        pos_feat = None
+        if self.use_freq_pos_enc and self.pos_branch is not None:
             # x: B, C, H, W
-            H = x.shape[2]
-            # Interpolate pos enc to match current H
-            # self.freq_pos_enc: 1, 1, max_H, 1
-            pos_enc = F.interpolate(self.freq_pos_enc, size=(H, 1), mode='bilinear', align_corners=False)
-            x = x + pos_enc
+            # Frequency profile: mean over Channel and Time (W)
+            # We want to capture energy distribution along Frequency (H)
+            freq_profile = x.mean(dim=[1, 3]) # B, H
+            
+            # Interpolate to match max_freq (input_size[0])
+            target_H = self.input_size[0]
+            if freq_profile.shape[1] != target_H:
+                freq_profile = F.interpolate(freq_profile.unsqueeze(1), size=target_H, mode='linear', align_corners=False).squeeze(1)
+            
+            pos_feat = self.pos_branch(freq_profile) # B, 64
 
         # If we have a shared stem, run it once and feed the result to each branch.
         if getattr(self, 'shared_stem', None) is not None:
@@ -383,6 +396,9 @@ class WTNet(nn.Module):
 
         # Encoder to Semantic
         out = self.encoder_to_semantic(out)
+
+        if pos_feat is not None:
+            out = torch.cat([out, pos_feat], dim=1)
 
         return out, aux_logits
 
