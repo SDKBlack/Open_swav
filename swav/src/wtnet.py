@@ -349,6 +349,19 @@ class WTNet(nn.Module):
             layers.append(nn.MaxPool2d(kernel_size=1, stride=2))
         return layers
 
+    def _forward_sequential_extract(self, sequential_module, x, extract_indices):
+        """
+        Forward pass through a sequential module, extracting outputs at specified layer indices.
+        extract_indices: list of integers (0-based layer index)
+        Returns: final_output, list_of_intermediate_outputs
+        """
+        extracted = []
+        for i, layer in enumerate(sequential_module):
+            x = layer(x)
+            if i in extract_indices:
+                extracted.append(x)
+        return x, extracted
+
     def forward_backbone(self, x):
         # Position Branch
         pos_feat = None
@@ -366,15 +379,38 @@ class WTNet(nn.Module):
             pos_feat = self.pos_branch(freq_profile) # B, 64
 
         # If we have a shared stem, run it once and feed the result to each branch.
+        # Note: Extraction logic assumes standard structure (no shared stem or handled separately)
+        # For simplicity, we extract from branches only.
+        
+        # Define extraction points (Layer indices)
+        # Block structure: WTConv, Conv1x1, BN, ReLU, MaxPool (5 layers)
+        # Block 0: 0-4
+        # Block 1: 5-9
+        # Block 2: 10-14 (16 channels)
+        # Block 3: 15-19 (32 channels) -> Extract at 19
+        # Block 4: 20-24 (64 channels) -> Extract at 24
+        # Block 5: 25-28 (128 channels, no pool)
+        # AvgPool: 29
+        
+        extract_indices = [19, 24] # Block 3 (32ch) and Block 4 (64ch)
+
         if getattr(self, 'shared_stem', None) is not None:
             shared = self.shared_stem(x)
+            # If shared stem is used, branch indices shift. 
+            # This is complex. For now, if shared stem is used, we skip deep extraction or need to adjust.
+            # Assuming no shared stem for this experiment as per config.
             e1 = self.encoder_d1(shared)
             e3 = self.encoder_d3(shared)
             e5 = self.encoder_d5(shared)
+            intermediates_flat = [] # Not supported with shared stem yet
         else:
-            e1 = self.encoder_d1(x)
-            e3 = self.encoder_d3(x)
-            e5 = self.encoder_d5(x)
+            e1, inter1 = self._forward_sequential_extract(self.encoder_d1, x, extract_indices)
+            e3, inter3 = self._forward_sequential_extract(self.encoder_d3, x, extract_indices)
+            e5, inter5 = self._forward_sequential_extract(self.encoder_d5, x, extract_indices)
+            
+            # interX is [Block3_out, Block4_out]
+            # We want to collect them.
+            intermediates_flat = inter1 + inter3 + inter5
 
         # Auxiliary Heads Forward
         aux_logits = {}
@@ -389,6 +425,21 @@ class WTNet(nn.Module):
         else:
             out = torch.cat([e1, e3, e5], dim=1)  # [B, 128*3, H, W]
 
+        # Capture intermediate features for Stage 2 Clustering
+        # Pool them to vectors [B, C]
+        intermediate_features = []
+        
+        # 1. Add the shallower intermediates we extracted
+        for feat in intermediates_flat:
+             f = F.adaptive_avg_pool2d(feat, (1, 1)).view(feat.size(0), -1)
+             intermediate_features.append(f)
+
+        # 2. Add the final branch outputs (Block 5) as before
+        for feat in [e1, e3, e5]:
+            # Adaptive Avg Pool to (1,1) and flatten
+            f = F.adaptive_avg_pool2d(feat, (1, 1)).view(feat.size(0), -1)
+            intermediate_features.append(f)
+        
         # Global Pooling
         # out = F.adaptive_avg_pool2d(out, (1, 1))
         out = self.pool(out)
@@ -400,7 +451,7 @@ class WTNet(nn.Module):
         if pos_feat is not None:
             out = torch.cat([out, pos_feat], dim=1)
 
-        return out, aux_logits
+        return out, aux_logits, intermediate_features
 
     def forward_head(self, x):
         if self.projection_head is not None:
@@ -422,8 +473,9 @@ class WTNet(nn.Module):
         )[1], 0)
         start_idx = 0
         aux_logits_list = []
+        intermediate_features_list = []
         for end_idx in idx_crops:
-            _out, _aux = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
+            _out, _aux, _inter = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
             if start_idx == 0:
                 output = _out
             else:
@@ -432,6 +484,12 @@ class WTNet(nn.Module):
             # Collect aux logits if available
             if _aux:
                 aux_logits_list.append(_aux)
+            
+            # Collect intermediate features
+            if _inter:
+                # _inter is a list of tensors [e1, e3, e5]
+                # We want to stack them later
+                intermediate_features_list.append(_inter)
                 
             start_idx = end_idx
         
@@ -441,6 +499,21 @@ class WTNet(nn.Module):
             for k in aux_logits_list[0].keys():
                 final_aux_logits[k] = torch.cat([d[k] for d in aux_logits_list], dim=0)
         
+        # Concatenate intermediate features across crops
+        # intermediate_features_list is a list (crops) of lists (branches) of tensors (batch)
+        # We want a single tensor [Total_Batch, Total_Channels]
+        final_intermediate = None
+        if intermediate_features_list:
+            # First, for each branch, concat across crops
+            num_branches = len(intermediate_features_list[0])
+            branch_feats = []
+            for b in range(num_branches):
+                # Concat the b-th branch feature from all crops
+                f = torch.cat([crop_feats[b] for crop_feats in intermediate_features_list], dim=0)
+                branch_feats.append(f)
+            # Now concat all branches together: [Total_Batch, C1+C2+C3]
+            final_intermediate = torch.cat(branch_feats, dim=1)
+
         logits = None
         if self.classifier is not None:
             # If labels are provided, we need to expand them to match the output size
@@ -480,9 +553,9 @@ class WTNet(nn.Module):
         
         if logits is not None:
             if self.use_aux_heads:
-                return embedding, proto_out, logits, final_aux_logits
-            return embedding, proto_out, logits
+                return embedding, proto_out, logits, final_aux_logits, final_intermediate
+            return embedding, proto_out, logits, final_intermediate
         
         if self.use_aux_heads:
-            return embedding, proto_out, final_aux_logits
-        return embedding, proto_out
+            return embedding, proto_out, final_aux_logits, final_intermediate
+        return embedding, proto_out, final_intermediate

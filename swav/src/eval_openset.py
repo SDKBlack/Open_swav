@@ -53,6 +53,7 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
         logger.info("Stage 2 UP: No samples predicted as unknown.")
         return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
 
+    # Use the passed test_X (which is now test_Combined) for clustering
     predict_unknown_X = test_X_np[unknown_mask]
     predict_unknown_Y = test_Y_np[unknown_mask]
     
@@ -74,13 +75,13 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
         theta_max = np.max(theta) if isinstance(theta, np.ndarray) else theta.max().item()
         
         if theta_u1 <= theta_max:
-            logger.info("Stage 2 UP: u=1 detected (Compact). Proceeding to clustering to find substructure.")
+            logger.info("Stage 2 UP: u=1 detected (Compact).")
             # Calculate UP (Precision of Unknowns)
             # a: number of true unknowns in predicted unknowns
-            # a = np.sum(test_Y_normalized[unknown_mask] == -1)
-            # c = predict_unknown_X.shape[0]
-            # up = a / c if c > 0 else 0.0
-            # return {'up_db': up, 'up_sil': up, 'up_kmeans': up}
+            a = np.sum(test_Y_normalized[unknown_mask] == -1)
+            c = predict_unknown_X.shape[0]
+            up = a / c if c > 0 else 0.0
+            return {'up_db': up, 'up_sil': up, 'up_kmeans': up}
     except Exception as e:
         logger.info(f"Stage 2 UP: u=1 check failed ({e}), proceeding to clustering.")
 
@@ -455,6 +456,134 @@ def plot_distance_histogram(d_ct, test_Y, num_known, metric_name, dump_path):
     plt.savefig(os.path.join(dump_path, filename), dpi=300)
     plt.close()
 
+def compute_osr_metrics(true_label, predict_label, num_known):
+    # Helper to compute metrics given fixed labels
+    # Reuses logic from metrics_stage_1 but adapted
+    
+    # Ensure numpy
+    if isinstance(true_label, torch.Tensor): true_label = true_label.numpy()
+    if isinstance(predict_label, torch.Tensor): predict_label = predict_label.numpy()
+    
+    # Normalize true labels for unknown handling
+    true_label_norm = true_label.copy()
+    true_label_norm[true_label_norm >= num_known] = -1
+    
+    num_samples = predict_label.shape[0]
+    ones = np.ones(num_samples)
+    
+    # TKR: Known samples accepted / Total known samples
+    # Known samples are those where true_label < num_known (or != -1 in normalized)
+    known_mask = (true_label_norm != -1)
+    if np.sum(known_mask) > 0:
+        tkr = np.sum(predict_label[known_mask] != -1) / np.sum(known_mask)
+    else:
+        tkr = 0.0
+
+    # TUR: Unknown samples rejected / Total unknown samples
+    unknown_mask = (true_label_norm == -1)
+    if np.sum(unknown_mask) > 0:
+        tur = np.sum(predict_label[unknown_mask] == -1) / np.sum(unknown_mask)
+    else:
+        tur = 0.0
+
+    # KP: Known samples accurately classified / All accepted samples
+    accepted_mask = (predict_label != -1)
+    if np.sum(accepted_mask) > 0:
+        # Only consider samples that are truly known AND accepted
+        # But KP definition is usually: Correctly Classified Knowns / All Accepted
+        # Wait, standard definition:
+        # Precision of known classes?
+        # Let's follow metrics_stage_1 logic:
+        # a = np.sum(true_label[true_label != (-ones)] == predict_label[true_label != (-ones)])
+        # This line in metrics_stage_1 looks at ONLY known samples.
+        # "the number of known samples are accurately classified"
+        
+        # Let's stick to the implementation in metrics_stage_1
+        # But we need to be careful about indices.
+        
+        # Correctly classified knowns:
+        # true_label == predict_label AND true_label is known
+        correct_known = (true_label_norm != -1) & (true_label_norm == predict_label)
+        
+        # Denominator: "the number of all accepted samples" (predict_label != -1)
+        # OR "the number of known samples" ?
+        # metrics_stage_1 says: "the number of known samples are accurately classified / the number of all accepted samples"
+        # But the code implementation in metrics_stage_1:
+        # a = np.sum(true_label[true_label != (-ones)] == predict_label[true_label != (-ones)])
+        # b = np.sum(predict_label != (-ones))
+        # The 'a' part filters true_label for knowns, and checks equality.
+        # But predict_label is not filtered? 
+        # Actually: predict_label[true_label != -1] aligns with true_label[true_label != -1]
+        # So it checks if known samples are correctly classified.
+        # It does NOT penalize if an unknown sample is accepted (misclassified as known).
+        # Wait, 'b' is total accepted. So if unknown is accepted, b increases, kp decreases. Correct.
+        
+        a = np.sum(correct_known)
+        b = np.sum(accepted_mask)
+        kp = a / b if b > 0 else 0.0
+    else:
+        kp = 0.0
+        
+    # FKR: Unknown samples accepted / Total unknown samples (1 - TUR)
+    fkr = 1.0 - tur
+    
+    # Mean Known Accuracy
+    # Accuracy on known classes only (ignoring rejection? or including rejection as error?)
+    # Usually: Correctly classified / Total Known
+    if np.sum(known_mask) > 0:
+        mean_acc = np.sum(correct_known) / np.sum(known_mask)
+    else:
+        mean_acc = 0.0
+        
+    return tkr, tur, kp, fkr, mean_acc
+
+def compute_prototype_distances(test_X, model, num_known):
+    """
+    使用模型自带的 Prototypes 计算余弦距离。
+    Distance = 1 - CosineSimilarity
+    """
+    # 1. 获取 Prototypes 权重
+    # 注意：根据您的代码，prototypes 可能是 nn.Linear 或 MultiPrototypes
+    # 这里假设是单头 nn.Linear，如果是 MultiPrototypes 需要取 self.prototypes.prototypes0
+    if hasattr(model, 'module'):
+        proto_layer = model.module.prototypes
+    else:
+        proto_layer = model.prototypes
+
+    # 兼容 MultiPrototypes (如果有多个头，我们通常取第一个)
+    if isinstance(proto_layer, torch.nn.ModuleList) or hasattr(proto_layer, 'prototypes0'):
+         # 假设 MultiPrototypes 结构
+         proto_weight = getattr(proto_layer, 'prototypes0').weight.data.cpu()
+    elif isinstance(proto_layer, torch.nn.Linear):
+         proto_weight = proto_layer.weight.data.cpu()
+    else:
+        # 如果没有 prototypes (比如微调阶段去掉了)，则回退到均值中心法
+        print("Warning: No prototypes found, skipping prototype distance.")
+        return None
+
+    # 2. 归一化 (SwAV 核心：在单位球面上比较)
+    # test_X: [N, D], proto_weight: [K, D]
+    test_X_norm = torch.nn.functional.normalize(test_X, p=2, dim=1)
+    proto_norm = torch.nn.functional.normalize(proto_weight, p=2, dim=1)
+
+    # 3. 计算余弦相似度 (Cosine Similarity)
+    # Sim = X * P^T
+    # Shape: [N, K]
+    cosine_sim = torch.matmul(test_X_norm, proto_norm.t())
+
+    # 4. 转换为“距离” (Distance)
+    # 因为 OSR 算法通常找“最小距离”，所以用 1 - Sim
+    # Sim 范围 [-1, 1], Dist 范围 [0, 2]
+    d_ct = 1.0 - cosine_sim.numpy()
+
+    # 5. 计算阈值 (Theta)
+    # 对于 SwAV，已知类的样本和它对应的 Prototype 相似度应该非常高 (距离接近 0)
+    # 我们依然可以用 outlier_check 来确定拒识阈值
+    # 这里我们只取每个样本到"所属类" Prototype 的距离来算阈值
+    # 但由于这是 Test 阶段，我们通常需要利用 Train Set 的特征来定阈值
+    # 为了简化，这里先返回 None，在主流程里处理
+    return d_ct
+
 def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     logger.info("Starting Open Set Evaluation...")
     model.eval()
@@ -477,7 +606,8 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
             output = ret[1]
             # Ignore logits/aux_logits for training data feature extraction
             
-            feats = output.cpu()
+            # Use embedding (projection head features) instead of output (prototypes/logits)
+            feats = embedding.cpu()
             train_features.append(feats)
             train_labels.append(labels)
             
@@ -489,9 +619,10 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     # 2. Extract features for test data (known + unknown)
     logger.info("Extracting features from test data...")
     test_features = []
-    test_labels = []
     test_embeddings_list = []
+    test_labels = []
     test_aux_logits_list = []
+    test_intermediate_list = []
     
     # Known test data
     with torch.no_grad():
@@ -499,24 +630,46 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
             inputs = inputs.to(device)
             ret = model(inputs)
             
+            # Unpack return values based on length
+            # Possible returns from WTNet.forward:
+            # 3: embedding, proto_out, final_intermediate
+            # 4: embedding, proto_out, final_aux_logits, final_intermediate
+            # 4: embedding, proto_out, logits, final_intermediate
+            # 5: embedding, proto_out, logits, final_aux_logits, final_intermediate
+            
             embedding = ret[0]
-            output = ret[1]
+            output = ret[1] # proto_out
             aux_logits = None
+            logits = None
+            intermediate = None
+            
             if len(ret) == 3:
+                intermediate = ret[2]
+            elif len(ret) == 4:
+                # Check type of 3rd element to distinguish between logits (Tensor) and aux_logits (dict)
                 if isinstance(ret[2], dict):
                     aux_logits = ret[2]
-            elif len(ret) == 4:
+                    intermediate = ret[3]
+                else:
+                    logits = ret[2]
+                    intermediate = ret[3]
+            elif len(ret) == 5:
+                logits = ret[2]
                 aux_logits = ret[3]
+                intermediate = ret[4]
 
             if i == 0:
                 # logger.info(f"DEBUG: ret length: {len(ret)}")
                 pass
 
-            test_features.append(output.cpu())
+            # Use embedding for test_features as well
+            test_features.append(embedding.cpu())
             test_embeddings_list.append(embedding.cpu())
             test_labels.append(labels)
             if aux_logits is not None:
                 test_aux_logits_list.append({k: v.cpu() for k, v in aux_logits.items()})
+            if intermediate is not None:
+                test_intermediate_list.append(intermediate.cpu())
             
     # Unknown test data
     if unknown_loader:
@@ -528,22 +681,49 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
                 embedding = ret[0]
                 output = ret[1]
                 aux_logits = None
+                logits = None
+                intermediate = None
+                
                 if len(ret) == 3:
+                    intermediate = ret[2]
+                elif len(ret) == 4:
                     if isinstance(ret[2], dict):
                         aux_logits = ret[2]
-                elif len(ret) == 4:
+                        intermediate = ret[3]
+                    else:
+                        logits = ret[2]
+                        intermediate = ret[3]
+                elif len(ret) == 5:
+                    logits = ret[2]
                     aux_logits = ret[3]
+                    intermediate = ret[4]
 
-                test_features.append(output.cpu())
+                # Use embedding for test_features as well
+                test_features.append(embedding.cpu())
                 test_embeddings_list.append(embedding.cpu())
                 test_labels.append(labels)
                 if aux_logits is not None:
                     test_aux_logits_list.append({k: v.cpu() for k, v in aux_logits.items()})
+                if intermediate is not None:
+                    test_intermediate_list.append(intermediate.cpu())
                 
     test_X = torch.cat(test_features, dim=0)
     test_Y = torch.cat(test_labels, dim=0)
     test_E = torch.cat(test_embeddings_list, dim=0)
     
+    # Concatenate intermediate features if available
+    if test_intermediate_list:
+        test_Inter = torch.cat(test_intermediate_list, dim=0)
+        # Combine Embedding (Final Layer) with Intermediate Features
+        # Normalize both before concatenation to avoid scale dominance
+        test_E_norm = torch.nn.functional.normalize(test_E, dim=1)
+        test_Inter_norm = torch.nn.functional.normalize(test_Inter, dim=1)
+        test_Combined = torch.cat([test_E_norm, test_Inter_norm], dim=1)
+        logger.info(f"Using Enhanced Features for Clustering: Dim {test_Combined.shape[1]} (Final {test_E.shape[1]} + Inter {test_Inter.shape[1]})")
+    else:
+        test_Combined = test_E
+        logger.info("Intermediate features not available, using Final Layer only.")
+
     # 3. Evaluate Euclidean Distance
     logger.info("Evaluating with Euclidean Distance...")
     d_ct_eu, theta_eu = compute_distances(train_X, train_Y, test_X, num_known, metric='euclidean')
@@ -565,7 +745,8 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     stage2_up_eu_kmeans = None
     try:
         logger.info("Computing Stage 2 UP (Euclidean)...")
-        res = compute_stage2_up(test_X, test_Y, label_hat_eu, theta_eu, num_known)
+        # Pass test_Combined instead of test_X for clustering
+        res = compute_stage2_up(test_Combined, test_Y, label_hat_eu, theta_eu, num_known)
         stage2_up_eu_db = res['up_db']
         stage2_up_eu_sil = res['up_sil']
         stage2_up_eu_kmeans = res.get('up_kmeans', None)
@@ -599,7 +780,8 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     stage2_up_mahal_kmeans = None
     try:
         logger.info("Computing Stage 2 UP (Mahalanobis)...")
-        res = compute_stage2_up(test_X, test_Y, label_hat_mahal, theta_mahal, num_known)
+        # Pass test_Combined instead of test_X for clustering
+        res = compute_stage2_up(test_Combined, test_Y, label_hat_mahal, theta_mahal, num_known)
         stage2_up_mahal_db = res['up_db']
         stage2_up_mahal_sil = res['up_sil']
         stage2_up_mahal_kmeans = res.get('up_kmeans', None)
@@ -613,85 +795,85 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
         logger.info(f"Stage 2 UP (Mahalanobis): failed ({e})")
 
     # --- Consistency Check Strategy ---
-    if test_aux_logits_list:
-        logger.info("Applying Consistency Check Strategy...")
-        
-        # Concatenate aux logits
-        keys = test_aux_logits_list[0].keys()
-        aux_preds = {}
-        for k in keys:
-            logits_k = torch.cat([d[k] for d in test_aux_logits_list], dim=0)
-            aux_preds[k] = torch.argmax(logits_k, dim=1).numpy()
-            
-        # Apply consistency
-        refined_label_hat = label_hat_eu.copy()
-        
-        for k in keys:
-            # If main prediction is known (>=0), it must match branch prediction
-            # If main prediction is unknown (-1), it remains unknown
-            disagreement = (refined_label_hat != -1) & (refined_label_hat != aux_preds[k])
-            refined_label_hat[disagreement] = -1
-            
-        # Re-evaluate metrics
-        test_Y_normalized = test_Y.numpy().copy()
-        test_Y_normalized[test_Y_normalized >= num_known] = -1
-        
-        tkr_cc, tur_cc, kp_cc, fkr_cc, accuracy_cc = metrics_stage_1(test_Y_normalized, refined_label_hat, num_known)
-        
-        logger.info(f"--- Consistency Check Results (Euclidean + Aux) ---")
-        logger.info(f"TKR: {tkr_cc:.4f}, TUR: {tur_cc:.4f}, KP: {kp_cc:.4f}, FKR: {fkr_cc:.4f}")
-        logger.info(f"Mean Known Accuracy: {np.mean(accuracy_cc):.4f}")
-        
-        # Stage 2 UP for Consistency Check (Euclidean)
-        stage2_up_cc_db = None
-        stage2_up_cc_sil = None
-        stage2_up_cc_kmeans = None
-        try:
-            logger.info("Computing Stage 2 UP (Consistency - Euclidean)...")
-            res = compute_stage2_up(test_X, test_Y, refined_label_hat, theta_eu, num_known)
-            stage2_up_cc_db = res['up_db']
-            stage2_up_cc_sil = res['up_sil']
-            stage2_up_cc_kmeans = res.get('up_kmeans', None)
-            logger.info(f"Stage 2 UP (Consistency - Euclidean) [DB]: {stage2_up_cc_db:.4f}")
-            logger.info(f"Stage 2 UP (Consistency - Euclidean) [Silhouette]: {stage2_up_cc_sil:.4f}")
-            if stage2_up_cc_kmeans is not None:
-                logger.info(f"Stage 2 UP (Consistency - Euclidean) [KMeans]: {stage2_up_cc_kmeans:.4f}")
-            else:
-                logger.info("Stage 2 UP (Consistency - Euclidean) [KMeans]: None")
-        except Exception as e:
-            logger.info(f"Stage 2 UP (Consistency - Euclidean): failed ({e})")
+    logger.info("Applying Consistency Check Strategy...")
+    # Use Euclidean for known classification, Mahalanobis for unknown rejection
+    # If Euclidean says known (label < num_known) AND Mahalanobis says known (dist < theta), accept as known
+    # Else reject as unknown
+    
+    # We need to re-run evaluate_metric with a custom logic or just combine results
+    # Here we implement a simple combination:
+    # Final Label = Euclidean Label if (Euclidean Label != -1 AND Mahalanobis Label != -1) else -1
+    # Wait, the standard consistency check is:
+    # If both accept, accept. If one rejects, reject.
+    
+    # Let's use the labels from previous steps
+    # label_hat_eu: -1 if rejected by Euclidean threshold
+    # label_hat_mahal: -1 if rejected by Mahalanobis threshold
+    
+    # But wait, label_hat contains the predicted class if accepted, or -1 if rejected.
+    # Consistency: Accept only if both accept AND they agree on the class (optional, but safer)
+    # Or just: Accept if both accept.
+    
+    # Strategy 1: Intersection of Acceptance
+    # If label_hat_eu != -1 AND label_hat_mahal != -1:
+    #    Final = label_hat_eu (assuming they agree or we trust Euclidean for classification)
+    # Else:
+    #    Final = -1
+    
+    label_hat_consistency = label_hat_eu.copy()
+    reject_mask = (label_hat_eu == -1) | (label_hat_mahal == -1)
+    label_hat_consistency[reject_mask] = -1
+    
+    # Evaluate Consistency Results
+    # We need a dummy distance list for the function API, but it won't be used for thresholding since we already have labels
+    # So we can just pass d_ct_eu and a dummy theta, but evaluate_metric re-calculates threshold if we pass distances.
+    # We should write a helper that takes labels directly.
+    
+    # Re-implement metrics calculation for fixed labels
+    tkr_c, tur_c, kp_c, fkr_c, mean_acc_c = compute_osr_metrics(test_Y, label_hat_consistency, num_known)
+    
+    logger.info("--- Consistency Check Results (Euclidean + Aux) ---")
+    logger.info(f"TKR: {tkr_c:.4f}, TUR: {tur_c:.4f}, KP: {kp_c:.4f}, FKR: {fkr_c:.4f}")
+    logger.info(f"Mean Known Accuracy: {mean_acc_c:.4f}")
+    
+    # Stage 2 UP for Consistency
+    logger.info("Computing Stage 2 UP (Consistency - Euclidean)...")
+    try:
+        # Pass test_Combined instead of test_X
+        res = compute_stage2_up(test_Combined, test_Y, label_hat_consistency, theta_eu, num_known)
+        logger.info(f"Stage 2 UP (Consistency - Euclidean) [DB]: {res['up_db']:.4f}")
+        logger.info(f"Stage 2 UP (Consistency - Euclidean) [Silhouette]: {res['up_sil']:.4f}")
+        if 'up_kmeans' in res:
+             logger.info(f"Stage 2 UP (Consistency - Euclidean) [KMeans]: {res['up_kmeans']:.4f}")
+    except Exception as e:
+        logger.info(f"Stage 2 UP (Consistency): failed ({e})")
 
-        # Apply consistency for Mahalanobis
-        refined_label_hat_mahal = label_hat_mahal.copy()
-        
-        for k in keys:
-            disagreement = (refined_label_hat_mahal != -1) & (refined_label_hat_mahal != aux_preds[k])
-            refined_label_hat_mahal[disagreement] = -1
-            
-        tkr_cc_m, tur_cc_m, kp_cc_m, fkr_cc_m, accuracy_cc_m = metrics_stage_1(test_Y_normalized, refined_label_hat_mahal, num_known)
-        
-        logger.info(f"--- Consistency Check Results (Mahalanobis + Aux) ---")
-        logger.info(f"TKR: {tkr_cc_m:.4f}, TUR: {tur_cc_m:.4f}, KP: {kp_cc_m:.4f}, FKR: {fkr_cc_m:.4f}")
-        logger.info(f"Mean Known Accuracy: {np.mean(accuracy_cc_m):.4f}")
-        
-        # Stage 2 UP for Consistency Check (Mahalanobis)
-        stage2_up_cc_m_db = None
-        stage2_up_cc_m_sil = None
-        stage2_up_cc_m_kmeans = None
-        try:
-            logger.info("Computing Stage 2 UP (Consistency - Mahalanobis)...")
-            res = compute_stage2_up(test_X, test_Y, refined_label_hat_mahal, theta_mahal, num_known)
-            stage2_up_cc_m_db = res['up_db']
-            stage2_up_cc_m_sil = res['up_sil']
-            stage2_up_cc_m_kmeans = res.get('up_kmeans', None)
-            logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [DB]: {stage2_up_cc_m_db:.4f}")
-            logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [Silhouette]: {stage2_up_cc_m_sil:.4f}")
-            if stage2_up_cc_m_kmeans is not None:
-                logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [KMeans]: {stage2_up_cc_m_kmeans:.4f}")
-            else:
-                logger.info("Stage 2 UP (Consistency - Mahalanobis) [KMeans]: None")
-        except Exception as e:
-            logger.info(f"Stage 2 UP (Consistency - Mahalanobis): failed ({e})")
+    # Strategy 2: Union of Rejection (Same as Intersection of Acceptance)
+    # What if we use Mahalanobis for rejection and Euclidean for classification?
+    # That is effectively what we did above, but we also required Euclidean to accept.
+    # If we trust Mahalanobis for rejection more:
+    # Final = label_hat_eu if label_hat_mahal != -1 else -1
+    
+    label_hat_consistency_2 = label_hat_eu.copy()
+    reject_mask_2 = (label_hat_mahal == -1)
+    label_hat_consistency_2[reject_mask_2] = -1
+    
+    tkr_c2, tur_c2, kp_c2, fkr_c2, mean_acc_c2 = compute_osr_metrics(test_Y, label_hat_consistency_2, num_known)
+    
+    logger.info("--- Consistency Check Results (Mahalanobis + Aux) ---")
+    logger.info(f"TKR: {tkr_c2:.4f}, TUR: {tur_c2:.4f}, KP: {kp_c2:.4f}, FKR: {fkr_c2:.4f}")
+    logger.info(f"Mean Known Accuracy: {mean_acc_c2:.4f}")
+    
+    logger.info("Computing Stage 2 UP (Consistency - Mahalanobis)...")
+    try:
+        # Pass test_Combined instead of test_X
+        res = compute_stage2_up(test_Combined, test_Y, label_hat_consistency_2, theta_mahal, num_known)
+        logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [DB]: {res['up_db']:.4f}")
+        logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [Silhouette]: {res['up_sil']:.4f}")
+        if 'up_kmeans' in res:
+             logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [KMeans]: {res['up_kmeans']:.4f}")
+    except Exception as e:
+        logger.info(f"Stage 2 UP (Consistency 2): failed ({e})")
 
     # 5. Return combined results
     results = {
@@ -711,5 +893,52 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
         'stage2_up_cc_m_sil': stage2_up_cc_m_sil if 'stage2_up_cc_m_sil' in locals() else None,
         'stage2_up_cc_m_kmeans': stage2_up_cc_m_kmeans if 'stage2_up_cc_m_kmeans' in locals() else None
     }
+    
+    # === 新增: Evaluate with SwAV Prototypes (Cosine) ===
+    logger.info("Evaluating with SwAV Prototypes (Cosine Distance)...")
+    
+    # 1. 计算 Train Set 的阈值 (Theta)
+    # 我们需要先算一遍训练集数据的距离，用来定阈值
+    d_train = compute_prototype_distances(train_X, model, num_known)
+    if d_train is not None:
+        theta_proto = np.zeros(num_known)
+        for clas in range(num_known):
+            # 找到属于该类别的训练样本
+            mask = (train_Y == clas).numpy()
+            if mask.sum() > 0:
+                # 取出这些样本到"自己类原型"的距离
+                # d_train 是 [N, K]，我们取第 clas 列
+                own_class_dist = d_train[mask, clas]
+                theta_proto[clas] = outlier_check(own_class_dist)
+        
+        # 2. 计算 Test Set 的距离
+        d_test = compute_prototype_distances(test_X, model, num_known)
+        
+        # 修正: d_test 的形状是 [N, K_prototypes]，而 num_known 是已知类数量
+        # 如果 K_prototypes > num_known (例如 54 > 18)，我们需要截断 d_test
+        # 假设前 num_known 个 prototypes 对应前 num_known 个类
+        if d_test.shape[1] > num_known:
+            d_test = d_test[:, :num_known]
+        
+        # 3. 评估指标
+        tkr_p, tur_p, kp_p, fkr_p, mean_acc_p, label_hat_p = evaluate_metric(
+            test_Y, d_test, torch.tensor(theta_proto), num_known, "SwAV Prototype Cosine"
+        )
+        
+        # 4. (可选) 绘制直方图
+        if hasattr(args, 'dump_path') and args.dump_path:
+             plot_distance_histogram(d_test, test_Y, num_known, "Prototype Cosine", args.dump_path)
+             
+        # 5. (可选) 计算 Stage 2 UP 指标
+        logger.info("Computing Stage 2 UP (Prototype Cosine)...")
+        try:
+            # Pass test_Combined instead of test_X for clustering
+            res = compute_stage2_up(test_Combined, test_Y, label_hat_p, theta_proto, num_known)
+            logger.info(f"Stage 2 UP (Prototype Cosine) [DB]: {res['up_db']:.4f}")
+            logger.info(f"Stage 2 UP (Prototype Cosine) [Silhouette]: {res['up_sil']:.4f}")
+            if 'up_kmeans' in res:
+                logger.info(f"Stage 2 UP (Prototype Cosine) [KMeans]: {res['up_kmeans']:.4f}")
+        except Exception as e:
+            logger.info(f"Stage 2 UP (Prototype Cosine): failed ({e})")
     
     return results
