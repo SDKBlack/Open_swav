@@ -328,7 +328,8 @@ def main():
     # wrap model
     model = nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[args.gpu_to_work_on]
+        device_ids=[args.gpu_to_work_on],
+        find_unused_parameters=True
     )
 
     # optionally resume from a checkpoint
@@ -499,28 +500,21 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         # ============ multi-res forward passes ... ============
         aux_logits = None
         if args.use_fp16:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 ret = model(inputs, labels)
-                # Handle variable return length
-                # Possible returns:
-                # (embedding, output)
-                # (embedding, output, logits)
-                # (embedding, output, aux_logits)
-                # (embedding, output, logits, aux_logits)
-                
                 embedding = ret[0]
                 output = ret[1]
                 logits = None
                 aux_logits = None
                 
-                if len(ret) == 3:
+                if len(ret) == 5:
+                    logits = ret[2]
+                    aux_logits = ret[3]
+                elif len(ret) == 4:
                     if isinstance(ret[2], dict):
                         aux_logits = ret[2]
                     else:
                         logits = ret[2]
-                elif len(ret) == 4:
-                    logits = ret[2]
-                    aux_logits = ret[3]
         else:
             ret = model(inputs, labels)
             embedding = ret[0]
@@ -528,14 +522,14 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             logits = None
             aux_logits = None
             
-            if len(ret) == 3:
+            if len(ret) == 5:
+                logits = ret[2]
+                aux_logits = ret[3]
+            elif len(ret) == 4:
                 if isinstance(ret[2], dict):
                     aux_logits = ret[2]
                 else:
                     logits = ret[2]
-            elif len(ret) == 4:
-                logits = ret[2]
-                aux_logits = ret[3]
             
         embedding_detached = embedding.detach()
         bs = inputs[0].size(0)
@@ -897,4 +891,4 @@ if __name__ == "__main__":
     main()
 
 
-# torchrun --nproc_per_node=1 main_swav.py   --arch wtnet   --data_path /root/autodl-tmp/S3R   --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train   --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test   --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown   --swav_weight 0.1   --epochs 200   --batch_size 128   --base_lr 0.1   --final_lr 0.001   --size_crops 224   --nmb_crops 6   --min_scale_crops 0.8   --max_scale_crops 1.0   --dump_path ./test_enc   --use_fp16 False   --use_boundary_loss true   --boundary_pos_start 1.0   --boundary_pos_thresh 0.2   --boundary_pos_anneal_epochs 50   --boundary_neg_thresh 1.3   --boundary_proto_thresh 1.3   --boundary_loss_weight 1.0   --nmb_prototypes 90   --use_aux_heads True   --aux_loss_weight 0.1  --use_freq_pos_enc true
+# torchrun --nproc_per_node=1 main_swav.py --arch wtnet --data_path /root/autodl-tmp/S3R --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown --swav_weight 0.5 --epochs 200 --batch_size 128 --base_lr 0.1 --final_lr 0.001 --size_crops 224 --nmb_crops 6 --min_scale_crops 0.8 --max_scale_crops 1.0 --dump_path ./test_active_pro --use_fp16 False --use_boundary_loss true --boundary_pos_start 1.0 --boundary_pos_thresh 0.2 --boundary_pos_anneal_epochs 50 --boundary_neg_thresh 1.3 --boundary_proto_thresh 1.3 --boundary_loss_weight 1.0 --nmb_prototypes 72 --use_aux_heads True --aux_loss_weight 0.1 --n_active_prototypes 54
