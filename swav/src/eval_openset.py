@@ -897,39 +897,62 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     # === 新增: Evaluate with SwAV Prototypes (Cosine) ===
     logger.info("Evaluating with SwAV Prototypes (Cosine Distance)...")
     
-    # 1. 计算 Train Set 的阈值 (Theta)
-    # 我们需要先算一遍训练集数据的距离，用来定阈值
+    # 1. 计算 Train Set 的距离 (所有 Prototypes)
     d_train = compute_prototype_distances(train_X, model, num_known)
+    
     if d_train is not None:
-        theta_proto = np.zeros(num_known)
+        # 2. 建立 Class -> Prototype 映射
+        # 因为 Prototypes 是无监督学习的，顺序不对应 Class ID
+        # 我们通过查看训练集每个类别的样本距离哪个 Prototype 最近来建立映射
+        class_to_proto_map = []
+        logger.info("Building Class -> Prototype mapping...")
+        
         for clas in range(num_known):
-            # 找到属于该类别的训练样本
             mask = (train_Y == clas).numpy()
             if mask.sum() > 0:
-                # 取出这些样本到"自己类原型"的距离
-                # d_train 是 [N, K]，我们取第 clas 列
-                own_class_dist = d_train[mask, clas]
+                # 计算该类所有样本到各个 Prototype 的平均距离
+                # d_train: [N, K]
+                mean_dists = np.mean(d_train[mask], axis=0)
+                # 选距离最近的 Prototype
+                best_p = np.argmin(mean_dists)
+                class_to_proto_map.append(best_p)
+                logger.info(f"  Class {clas} -> Prototype {best_p} (Dist: {mean_dists[best_p]:.4f})")
+            else:
+                # Fallback if no samples (should not happen)
+                class_to_proto_map.append(clas if clas < d_train.shape[1] else 0)
+                logger.info(f"  Class {clas} -> Prototype {class_to_proto_map[-1]} (Fallback)")
+
+        # 3. 映射 d_train 到 [N, num_known]
+        d_train_mapped = np.zeros((d_train.shape[0], num_known))
+        for clas in range(num_known):
+            proto_idx = class_to_proto_map[clas]
+            d_train_mapped[:, clas] = d_train[:, proto_idx]
+
+        # 4. 计算阈值 (Theta)
+        theta_proto = np.zeros(num_known)
+        for clas in range(num_known):
+            mask = (train_Y == clas).numpy()
+            if mask.sum() > 0:
+                own_class_dist = d_train_mapped[mask, clas]
                 theta_proto[clas] = outlier_check(own_class_dist)
         
-        # 2. 计算 Test Set 的距离
+        # 5. 计算 Test Set 的距离并映射
         d_test = compute_prototype_distances(test_X, model, num_known)
+        d_test_mapped = np.zeros((d_test.shape[0], num_known))
+        for clas in range(num_known):
+            proto_idx = class_to_proto_map[clas]
+            d_test_mapped[:, clas] = d_test[:, proto_idx]
         
-        # 修正: d_test 的形状是 [N, K_prototypes]，而 num_known 是已知类数量
-        # 如果 K_prototypes > num_known (例如 54 > 18)，我们需要截断 d_test
-        # 假设前 num_known 个 prototypes 对应前 num_known 个类
-        if d_test.shape[1] > num_known:
-            d_test = d_test[:, :num_known]
-        
-        # 3. 评估指标
+        # 6. 评估指标
         tkr_p, tur_p, kp_p, fkr_p, mean_acc_p, label_hat_p = evaluate_metric(
-            test_Y, d_test, torch.tensor(theta_proto), num_known, "SwAV Prototype Cosine"
+            test_Y, d_test_mapped, torch.tensor(theta_proto), num_known, "SwAV Prototype Cosine"
         )
         
-        # 4. (可选) 绘制直方图
+        # 7. (可选) 绘制直方图
         if hasattr(args, 'dump_path') and args.dump_path:
-             plot_distance_histogram(d_test, test_Y, num_known, "Prototype Cosine", args.dump_path)
+             plot_distance_histogram(d_test_mapped, test_Y, num_known, "Prototype Cosine", args.dump_path)
              
-        # 5. (可选) 计算 Stage 2 UP 指标
+        # 8. (可选) 计算 Stage 2 UP 指标
         logger.info("Computing Stage 2 UP (Prototype Cosine)...")
         try:
             # Pass test_Combined instead of test_X for clustering
