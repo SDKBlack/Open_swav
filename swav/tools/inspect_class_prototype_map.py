@@ -22,6 +22,10 @@ def get_args():
     parser.add_argument("--nmb_prototypes", type=int, default=45)
     parser.add_argument("--use_sk_fusion", type=lambda x: (str(x).lower() == 'true'), default=False)
     parser.add_argument("--pooling_type", type=str, default="gem")
+    parser.add_argument("--hidden_mlp", type=int, default=0, help="Hidden MLP size for projection head")
+    parser.add_argument("--feat_dim", type=int, default=128, help="Output feature dim / projection dim")
+    parser.add_argument("--num_classes", type=int, default=0, help="Number of known classes (for model instantiation)")
+    parser.add_argument("--use_aux_heads", type=lambda x: (str(x).lower() == 'true'), default=False, help="Whether model uses aux heads")
     
     # Data params
     parser.add_argument("--batch_size", type=int, default=128)
@@ -37,17 +41,20 @@ def load_model(args):
     # Override args to match checkpoint structure inferred from errors
     # Checkpoint has 384 dim features (3 branches * 128), so sk_fusion=False
     # Checkpoint has 384 dim into projection, so pooling didn't expand (gem/avg)
-    print("Overriding model args to match checkpoint: use_sk_fusion=False, pooling_type='gem'")
+    print("Overriding model args to match checkpoint (from args where provided)")
     model = WTNet(
-        in_channels=3,
-        input_size=[512, 512],
-        semantic_dim=128,
-        num_classes=0,
-        output_dim=128, 
-        hidden_mlp=0,
+        normalize=True,
+        output_dim=args.feat_dim,
+        hidden_mlp=args.hidden_mlp,
         nmb_prototypes=args.nmb_prototypes,
-        use_sk_fusion=False,
-        pooling_type='gem',
+        num_classes=args.num_classes,
+        use_shared_stem=False,
+        shared_stem_blocks=2,
+        use_sk_fusion=args.use_sk_fusion,
+        pooling_type=args.pooling_type,
+        use_aux_heads=args.use_aux_heads,
+        use_freq_pos_enc=True,
+        input_size=[224, 224],
     )
 
     
@@ -85,11 +92,12 @@ def process_loader(loader, model, device, class_to_proto, proto_to_class, prefix
             
             # Forward
             ret = model(img)
-            # ret is (embedding, proto_out) or (embedding, proto_out, logits)
-            if len(ret) == 3:
-                _, proto_out, _ = ret
+            # ret can be a tuple with variable length; proto_out is always at index 1
+            if isinstance(ret, (list, tuple)) and len(ret) >= 2:
+                proto_out = ret[1]
             else:
-                _, proto_out = ret
+                # Unexpected return structure
+                raise RuntimeError(f"Unexpected model return structure with length {len(ret) if isinstance(ret, (list,tuple)) else 'NA'}")
             
             # proto_out: [B, nmb_prototypes]
             # Get hard assignment
