@@ -542,32 +542,73 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         loss = 0
         boundary_loss = 0
         aux_loss = 0
+        
+        # === 新增：定义活跃原型的数量 ===
+        # 假设前 num_classes 个原型是给已知类的，剩下的是幽灵原型
+        # 如果 args.num_classes 没有设置，您可能需要手动指定，或者用 args.nmb_prototypes 的一部分
+        n_active = args.num_classes if args.num_classes > 0 else 18 
+        # 确保不超过总原型数
+        n_active = min(n_active, args.nmb_prototypes)
+        
         for i, crop_id in enumerate(args.crops_for_assign):
             with torch.no_grad():
                 out = output[bs * crop_id: bs * (crop_id + 1)].detach()
+
+                # === 修改点 1: 仅截取“活跃原型”的 logits 传给 Sinkhorn ===
+                # out 的形状是 [Batch_Size, nmb_prototypes]
+                # 我们只取前 n_active 列 [Batch_Size, n_active]
+                out_active = out[:, :n_active]
 
                 # time to use the queue
                 if queue is not None:
                     if use_the_queue or not torch.all(queue[i, -1, :] == 0):
                         use_the_queue = True
-                        out = torch.cat((torch.mm(
+                        
+                        # 队列中的特征也只跟活跃原型做计算
+                        queue_proto_logits = torch.mm(
                             queue[i],
-                            model.module.prototypes.weight.t()
-                        ), out))
+                            model.module.prototypes.weight[:n_active].t() # 只用活跃原型的权重
+                        )
+                        out_active = torch.cat((queue_proto_logits, out_active))
+                    
                     # fill the queue
                     queue[i, bs:] = queue[i, :-bs].clone()
                     queue[i, :bs] = embedding_detached[crop_id * bs: (crop_id + 1) * bs]
 
-                # get assignments
-                q = distributed_sinkhorn(out)[-bs:]
+                # get assignments (q 现在的维度是 [Batch_Size, n_active])
+                # Sinkhorn 现在只会把样本分配给这 n_active 个原型，完美避开了幽灵原型
+                q = distributed_sinkhorn(out_active)[-bs:]
 
             # cluster assignment prediction
             subloss = 0
             for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
-                x = output[bs * v: bs * (v + 1)] / args.temperature
-                subloss -= torch.mean(torch.sum(q * F.log_softmax(x, dim=1), dim=1))
+                # === 修改点 2: 计算 Loss 时也只看活跃原型 ===
+                # 获取 prediction logits
+                logits_all = output[bs * v: bs * (v + 1)] / args.temperature
+                
+                # 截取活跃部分
+                logits_active = logits_all[:, :n_active]
+                
+                # 标准 SwAV Loss (只在活跃原型上计算)
+                subloss -= torch.mean(torch.sum(q * F.log_softmax(logits_active, dim=1), dim=1))
+                
+                # === 修改点 3: 幽灵原型的“互斥损失” (Ghost Push-Away Loss) ===
+                # 我们希望已知类样本与幽灵原型的相似度越低越好
+                if n_active < args.nmb_prototypes:
+                    # 取出幽灵原型的 logits
+                    logits_ghost = logits_all[:, n_active:]
+                    # 目标：最小化这些 logits 的值 (或者最大化它们的负值)
+                    # 简单做法：L2 正则化或者 LogSumExp 最小化
+                    # 这里用一个简单的 hinge loss 风格：强迫相似度小于某个负阈值，或者直接 minimize mean
+                    # 因为 SwAV 的 logits 是点积 / temp，值越大越相似。我们希望值越小越好。
+                    
+                    # 策略：Minimize Mean(Logits_Ghost)
+                    # 赋予一个权重 (ghost_loss_weight)，例如 0.1
+                    ghost_penalty = torch.mean(logits_ghost)
+                    subloss += 0.1 * ghost_penalty
+
             loss += subloss / (np.sum(args.nmb_crops) - 1)
-            
+
         loss /= len(args.crops_for_assign)
         # Track raw (unweighted) SwAV loss
         try:
