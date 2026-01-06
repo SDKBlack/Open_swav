@@ -676,18 +676,59 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 # Start from raw boundary loss; mixup term (if enabled) is added separately
                 boundary_loss = boundary_loss_raw
 
-                # ============ Mixup for Virtual Unknowns ... ============
+                # ============ Mixup for Virtual Unknowns (Ghost Attraction) ============
+                # This mixup creates virtual "unknown" samples and pulls them
+                # towards the ghost prototypes (indices [n_active:]) while
+                # pushing them away from active prototypes. The resulting
+                # mixup loss is added to the SwAV loss term so prototypes
+                # learn to represent unknowns.
                 if args.use_mixup:
-                    # 1. Random Mixup
+                    # 1. Sample mixup ratio
                     lam = np.random.beta(1.0, 1.0)
-                    batch_size_feats = backbone_feats.size(0)
-                    index = torch.randperm(batch_size_feats).cuda()
-                    virtual_unknowns = lam * backbone_feats + (1 - lam) * backbone_feats[index]
 
-                    # 2. & 3. Calculate distance to prototypes and force > neg_thresh
-                    mixup_loss_raw = boundary_criterion.forward_virtual(virtual_unknowns)
-                    mixup_losses.update(float(mixup_loss_raw.item()), n_feats)
-                    boundary_loss += args.mixup_loss_weight * mixup_loss_raw
+                    # 2. Use the first crop's detached embedding as per-sample feats
+                    # embedding_detached has shape [B * n_crops, D], select first crop
+                    try:
+                        feats = embedding_detached[0:bs]
+                    except Exception:
+                        feats = embedding_detached
+
+                    # 3. Random permutation on batch dimension (place on same device)
+                    device = feats.device
+                    index = torch.randperm(bs, device=device)
+                    virtual_unknowns = lam * feats + (1.0 - lam) * feats[index]
+
+                    # 4. Normalize (SwAV works on unit sphere)
+                    virtual_unknowns = nn.functional.normalize(virtual_unknowns, dim=1, p=2)
+
+                    # 5. Compute logits to prototypes. Prefer projection_head if present,
+                    # otherwise compute dot-product with prototype weights.
+                    if hasattr(model.module, 'projection_head') and callable(getattr(model.module, 'projection_head')):
+                        try:
+                            out_mixup = model.module.projection_head(virtual_unknowns)
+                        except Exception:
+                            out_mixup = torch.mm(virtual_unknowns, model.module.prototypes.weight.t())
+                    else:
+                        out_mixup = torch.mm(virtual_unknowns, model.module.prototypes.weight.t())
+
+                    # 6. Split into active / ghost logits
+                    logits_active = out_mixup[:, :n_active]
+                    logits_ghost = out_mixup[:, n_active:]
+
+                    # 7. Push away from active prototypes, pull toward ghost prototypes.
+                    # Use logsumexp for stable aggregated activation.
+                    push_active = torch.mean(torch.logsumexp(logits_active / args.temperature, dim=1))
+                    pull_ghost = -torch.mean(torch.logsumexp(logits_ghost / args.temperature, dim=1))
+
+                    mixup_loss = push_active + pull_ghost
+
+                    # Add mixup loss into the SwAV loss term (loss variable)
+                    try:
+                        loss = loss + args.mixup_loss_weight * mixup_loss
+                    except Exception:
+                        loss += args.mixup_loss_weight * mixup_loss
+
+                    mixup_losses.update(float(mixup_loss.item()), bs)
                 else:
                     mixup_losses.update(0.0, n_feats)
             else:
