@@ -701,6 +701,29 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         
         total_loss = args.swav_weight * loss + ce_loss + args.boundary_loss_weight * boundary_loss + args.aux_loss_weight * aux_loss
 
+        # If any component goes non-finite, skip this batch to avoid corrupting weights/scaler.
+        # This is especially important for fp16 where overflow is easier.
+        if not torch.isfinite(total_loss):
+            if args.rank == 0:
+                def _finite(x):
+                    try:
+                        return bool(torch.isfinite(x).all().item())
+                    except Exception:
+                        return True
+                logger.warning(
+                    "Non-finite loss detected; skipping step. "
+                    f"total={float(total_loss.detach().cpu()) if torch.is_tensor(total_loss) else total_loss}, "
+                    f"swav_finite={_finite(loss)}, ce_finite={_finite(ce_loss)}, aux_finite={_finite(aux_loss)}, boundary_finite={_finite(boundary_loss)}"
+                )
+            optimizer.zero_grad(set_to_none=True)
+            if args.use_fp16:
+                try:
+                    scaler.update()
+                except Exception:
+                    pass
+            end = time.time()
+            continue
+
         # ============ backward and optim step ... ============
         optimizer.zero_grad()
         if args.use_fp16:
@@ -836,7 +859,11 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
 
 @torch.no_grad()
 def distributed_sinkhorn(out):
-    Q = torch.exp(out / args.epsilon).t() # Q is K-by-B for consistency with notations from our paper
+    # Numerical stability: exp(out/eps) can overflow (especially with fp16) and create inf/NaN.
+    # Subtract per-sample max before exp, same as stable softmax.
+    out = out / args.epsilon
+    out = out - torch.max(out, dim=1, keepdim=True)[0]
+    Q = torch.exp(out).t()  # Q is K-by-B for consistency with notations from our paper
     B = Q.shape[1] * args.world_size # number of samples to assign
     K = Q.shape[0] # how many prototypes
 
@@ -891,4 +918,4 @@ if __name__ == "__main__":
     main()
 
 
-# torchrun --nproc_per_node=1 main_swav.py --arch wtnet --data_path /root/autodl-tmp/S3R --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown --swav_weight 0.5 --epochs 200 --batch_size 128 --base_lr 0.1 --final_lr 0.001 --size_crops 224 --nmb_crops 6 --min_scale_crops 0.8 --max_scale_crops 1.0 --dump_path ./test_active_pro --use_fp16 False --use_boundary_loss true --boundary_pos_start 1.0 --boundary_pos_thresh 0.2 --boundary_pos_anneal_epochs 50 --boundary_neg_thresh 1.3 --boundary_proto_thresh 1.3 --boundary_loss_weight 1.0 --nmb_prototypes 72 --use_aux_heads True --aux_loss_weight 0.1 --n_active_prototypes 54
+# torchrun --nproc_per_node=1 main_swav.py --arch wtnet --data_path /root/autodl-tmp/S3R --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown --swav_weight 0.5 --epochs 200 --batch_size 128 --base_lr 0.1 --final_lr 0.001 --size_crops 224 --nmb_crops 6 --min_scale_crops 0.8 --max_scale_crops 1.0 --dump_path ./test_active_pro --use_fp16 True --use_boundary_loss true --boundary_pos_start 0.5 --boundary_pos_thresh 0.3 --boundary_pos_anneal_epochs 50 --boundary_neg_thresh 0.9 --boundary_proto_thresh 0.9 --boundary_loss_weight 1.0 --nmb_prototypes 72 --use_aux_heads True --aux_loss_weight 0.1 --n_active_prototypes 54 --use_freq_pos_enc True
