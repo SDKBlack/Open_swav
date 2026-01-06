@@ -26,6 +26,7 @@ def get_args():
     parser.add_argument("--feat_dim", type=int, default=128, help="Output feature dim / projection dim")
     parser.add_argument("--num_classes", type=int, default=0, help="Number of known classes (for model instantiation)")
     parser.add_argument("--use_aux_heads", type=lambda x: (str(x).lower() == 'true'), default=False, help="Whether model uses aux heads")
+    parser.add_argument("--use_freq_pos_enc", type=lambda x: (str(x).lower() == 'true'), default=False, help="Use freq pos encoding")
     
     # Data params
     parser.add_argument("--batch_size", type=int, default=128)
@@ -53,7 +54,7 @@ def load_model(args):
         use_sk_fusion=args.use_sk_fusion,
         pooling_type=args.pooling_type,
         use_aux_heads=args.use_aux_heads,
-        use_freq_pos_enc=True,
+        use_freq_pos_enc=args.use_freq_pos_enc,
         input_size=[224, 224],
     )
 
