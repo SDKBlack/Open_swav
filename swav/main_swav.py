@@ -117,7 +117,7 @@ parser.add_argument("--local_rank", default=0, type=int,
 parser.add_argument("--arch", default="resnet50", type=str, help="convnet architecture")
 parser.add_argument("--hidden_mlp", default=2048, type=int,
                     help="hidden layer dimension in projection head")
-parser.add_argument("--workers", default=10, type=int,
+parser.add_argument("--workers", default=25, type=int,
                     help="number of data loading workers")
 parser.add_argument("--checkpoint_freq", type=int, default=25,
                     help="Save the model periodically")
@@ -604,7 +604,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                     # 策略：Minimize Mean(Logits_Ghost)
                     # 赋予一个权重 (ghost_loss_weight)，例如 0.1
                     ghost_penalty = torch.mean(logits_ghost)
-                    subloss += 0.1 * ghost_penalty
+                    subloss += 1 * ghost_penalty
 
             loss += subloss / (np.sum(args.nmb_crops) - 1)
 
@@ -684,7 +684,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                 # learn to represent unknowns.
                 if args.use_mixup:
                     # 1. Sample mixup ratio
-                    lam = np.random.beta(1.0, 1.0)
+                    lam = np.random.beta(5.0, 5.0)
 
                     # 2. Use the first crop's detached embedding as per-sample feats
                     # embedding_detached has shape [B * n_crops, D], select first crop
@@ -715,19 +715,47 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                     logits_active = out_mixup[:, :n_active]
                     logits_ghost = out_mixup[:, n_active:]
 
-                    # 7. Push away from active prototypes, pull toward ghost prototypes.
-                    # Use logsumexp for stable aggregated activation.
-                    push_active = torch.mean(torch.logsumexp(logits_active / args.temperature, dim=1))
-                    pull_ghost = -torch.mean(torch.logsumexp(logits_ghost / args.temperature, dim=1))
+                    # 3. 修正后的 Mixup Loss (基于 Log-Softmax 的二分类)
+                    # active_score: 代表样本属于"已知类"的总强度 (LogSumExp)
+                    active_score = torch.logsumexp(logits_active / args.temperature, dim=1)
 
-                    mixup_loss = push_active + pull_ghost
+                    # ghost_score: 代表样本属于"未知/幽灵类"的总强度 (LogSumExp)
+                    ghost_score = torch.logsumexp(logits_ghost / args.temperature, dim=1)
 
-                    # Add mixup loss into the SwAV loss term (loss variable)
-                    try:
-                        loss = loss + args.mixup_loss_weight * mixup_loss
-                    except Exception:
-                        loss += args.mixup_loss_weight * mixup_loss
+                    # 构建二分类 logits: [Batch, 2]
+                    # 第0列是 active_score, 第1列是 ghost_score
+                    binary_logits = torch.stack([active_score, ghost_score], dim=1)
 
+                    # 标签：全为 1 (因为这些是 Virtual Unknowns，我们希望它们属于 Ghost)
+                    binary_labels = torch.ones(bs, dtype=torch.long, device=binary_logits.device)
+
+                    # 使用标准的 CrossEntropyLoss，这样 Loss 永远 >= 0
+                    loss_binary = nn.CrossEntropyLoss()(binary_logits, binary_labels)
+
+                    # === 核心解药：Ghost 内部的 Sinkhorn 互斥 (Sub-SwAV Loss) ===
+                    # 强制 ghost 原型内部多样化，避免单个原型占满全部混合样本
+                    subloss_ghost = torch.tensor(0.0, device=out_mixup.device)
+                    num_ghost = logits_ghost.size(1) if logits_ghost is not None else 0
+                    if num_ghost > 0:
+                        with torch.no_grad():
+                            # distributed_sinkhorn expects [B, K] logits
+                            # it returns assignments of shape [B, K]
+                            try:
+                                q_ghost = distributed_sinkhorn(logits_ghost)[-bs:]
+                            except Exception:
+                                # fallback: uniform soft assignments to avoid crashing
+                                q_ghost = torch.ones(bs, num_ghost, device=logits_ghost.device) / float(num_ghost)
+
+                        # 子 SwAV Loss（在 ghost 原型上计算 SwAV 风格的聚类损失）
+                        subloss_ghost = -torch.mean(torch.sum(q_ghost * F.log_softmax(logits_ghost / args.temperature, dim=1), dim=1))
+
+                    # 合并二分类 loss 与 子 SwAV loss
+                    mixup_loss = loss_binary + 1.0 * subloss_ghost
+
+                    # 更新总 Loss（用 mixup 权重调节整体影响）
+                    loss = loss + args.mixup_loss_weight * mixup_loss
+
+                    # 记录以便观察（记录合并后的 mixup_loss）
                     mixup_losses.update(float(mixup_loss.item()), bs)
                 else:
                     mixup_losses.update(0.0, n_feats)
@@ -959,4 +987,4 @@ if __name__ == "__main__":
     main()
 
 
-# torchrun --nproc_per_node=1 main_swav.py --arch wtnet --data_path /root/autodl-tmp/S3R --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown --swav_weight 0.5 --epochs 200 --batch_size 128 --base_lr 0.1 --final_lr 0.001 --size_crops 224 --nmb_crops 6 --min_scale_crops 0.8 --max_scale_crops 1.0 --dump_path ./test_active_pro --use_fp16 True --use_boundary_loss true --boundary_pos_start 0.5 --boundary_pos_thresh 0.3 --boundary_pos_anneal_epochs 50 --boundary_neg_thresh 0.9 --boundary_proto_thresh 0.9 --boundary_loss_weight 1.0 --nmb_prototypes 72 --use_aux_heads True --aux_loss_weight 0.1 --n_active_prototypes 54 --use_freq_pos_enc True
+# torchrun --nproc_per_node=1 main_swav.py --arch wtnet --data_path /root/autodl-tmp/S3R --split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_train --test_split_path /root/autodl-tmp/S3R/experiment_groups/1-known_for_test --unknown_split_path /root/autodl-tmp/S3R/experiment_groups/1-unknown --swav_weight 0.5 --epochs 200 --batch_size 128 --base_lr 0.1 --final_lr 0.001 --size_crops 224 --nmb_crops 6 --min_scale_crops 0.8 --max_scale_crops 1.0 --dump_path ./test_active_pro_mixup --use_fp16 True --use_boundary_loss true --boundary_pos_start 0.5 --boundary_pos_thresh 0.3 --boundary_pos_anneal_epochs 50 --boundary_neg_thresh 0.9 --boundary_proto_thresh 0.9 --boundary_loss_weight 1.0 --nmb_prototypes 72 --use_aux_heads True --aux_loss_weight 0.1 --n_active_prototypes 54 --use_freq_pos_enc True  --use_mixup True --mixup_loss_weight 0.5
