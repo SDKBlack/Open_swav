@@ -535,7 +535,13 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         bs = inputs[0].size(0)
 
         # ============ swav loss ... ============
+        # IMPORTANT: keep `loss` as the SwAV loss accumulator (it is what gets
+        # reported as "SWAV Loss" in logs). Any auxiliary regularizers should
+        # NOT be merged into this variable if we want SWAV loss to stay
+        # non-negative and comparable across runs.
         loss = 0
+        ghost_reg_loss = 0
+        mixup_reg_loss = 0
         boundary_loss = 0
         aux_loss = 0
         
@@ -601,10 +607,13 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                     # 这里用一个简单的 hinge loss 风格：强迫相似度小于某个负阈值，或者直接 minimize mean
                     # 因为 SwAV 的 logits 是点积 / temp，值越大越相似。我们希望值越小越好。
                     
-                    # 策略：Minimize Mean(Logits_Ghost)
-                    # 赋予一个权重 (ghost_loss_weight)，例如 0.1
-                    ghost_penalty = torch.mean(logits_ghost)
-                    subloss += 1 * ghost_penalty
+                    # 策略：让 ghost logits "不要太大"。
+                    # 注意：直接最小化 mean(logits_ghost) 可能为负，从而让 total_loss 变负。
+                    # 这里改成最小化 softplus(logits_ghost) 的均值（始终 >= 0），目标仍然是
+                    # 压低 logits_ghost（logit 越大惩罚越大）。
+                    ghost_penalty = F.softplus(logits_ghost).mean()
+                    # Keep as separate regularizer so SWAV loss meter stays meaningful.
+                    ghost_reg_loss = ghost_reg_loss + 1.0 * ghost_penalty
 
             loss += subloss / (np.sum(args.nmb_crops) - 1)
 
@@ -631,7 +640,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
         else:
             aux_losses.update(0.0, bs)
             
-        # ============ Boundary Loss ... ============
+    # ============ Boundary Loss ... ============
         boundary_loss = 0
         boundary_loss_raw = 0
         mixup_loss_raw = 0
@@ -753,7 +762,9 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
                     mixup_loss = loss_binary + 1.0 * subloss_ghost
 
                     # 更新总 Loss（用 mixup 权重调节整体影响）
-                    loss = loss + args.mixup_loss_weight * mixup_loss
+                    # Do NOT add into `loss` (SwAV). Keep separate so SWAV loss
+                    # meter stays meaningful.
+                    mixup_reg_loss = mixup_reg_loss + args.mixup_loss_weight * mixup_loss
 
                     # 记录以便观察（记录合并后的 mixup_loss）
                     mixup_losses.update(float(mixup_loss.item()), bs)
@@ -768,7 +779,14 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue, scaler, bou
             boundary_losses.update(0.0, bs)
             mixup_losses.update(0.0, bs)
         
-        total_loss = args.swav_weight * loss + ce_loss + args.boundary_loss_weight * boundary_loss + args.aux_loss_weight * aux_loss
+        total_loss = (
+            args.swav_weight * loss
+            + ce_loss
+            + args.boundary_loss_weight * boundary_loss
+            + args.aux_loss_weight * aux_loss
+            + ghost_reg_loss
+            + mixup_reg_loss
+        )
 
         # If any component goes non-finite, skip this batch to avoid corrupting weights/scaler.
         # This is especially important for fp16 where overflow is easier.
@@ -960,6 +978,11 @@ def validate(val_loader, model):
     model.eval()
     correct = 0
     total = 0
+
+    # Per-class stats
+    # We don't assume labels are contiguous or start from 0 (unknown may be >= num_known).
+    per_class_total = {}
+    per_class_correct = {}
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs = inputs.cuda(non_blocking=True)
@@ -975,10 +998,28 @@ def validate(val_loader, model):
                 _, predicted = torch.max(logits.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
+
+                # update per-class meters on CPU scalars to avoid holding GPU tensors
+                for y, yhat in zip(labels.view(-1), predicted.view(-1)):
+                    yi = int(y.item())
+                    per_class_total[yi] = per_class_total.get(yi, 0) + 1
+                    if int(yhat.item()) == yi:
+                        per_class_correct[yi] = per_class_correct.get(yi, 0) + 1
+                    else:
+                        per_class_correct.setdefault(yi, per_class_correct.get(yi, 0))
                 
     if total > 0:
         acc = 100 * correct / total
         logger.info(f"Validation Accuracy: {acc:.2f}%")
+
+        # Print per-class accuracy (known + unknown labels will naturally appear)
+        if len(per_class_total) > 0:
+            logger.info("Validation Per-class Accuracy:")
+            for cls in sorted(per_class_total.keys()):
+                tot = per_class_total[cls]
+                cor = per_class_correct.get(cls, 0)
+                cls_acc = 100.0 * float(cor) / float(tot) if tot > 0 else 0.0
+                logger.info(f"  Class {cls}: {cls_acc:.2f}% ({cor}/{tot})")
         return acc
     return 0
 

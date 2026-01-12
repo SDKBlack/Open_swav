@@ -51,7 +51,17 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
     unknown_mask = (label_hat == -1)
     if np.sum(unknown_mask) == 0:
         logger.info("Stage 2 UP: No samples predicted as unknown.")
-        return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
+        return {
+            'up_db': 0.0,
+            'up_sil': 0.0,
+            'up_kmeans': 0.0,
+            'unknown_acc_db': {},
+            'unknown_acc_sil': {},
+            'unknown_acc_kmeans': {},
+            'unknown_acc_mean_db': 0.0,
+            'unknown_acc_mean_sil': 0.0,
+            'unknown_acc_mean_kmeans': 0.0,
+        }
 
     # Use the passed test_X (which is now test_Combined) for clustering
     predict_unknown_X = test_X_np[unknown_mask]
@@ -81,7 +91,19 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
             a = np.sum(test_Y_normalized[unknown_mask] == -1)
             c = predict_unknown_X.shape[0]
             up = a / c if c > 0 else 0.0
-            return {'up_db': up, 'up_sil': up, 'up_kmeans': up}
+            # With u=1 we cannot classify per unknown class (only one cluster).
+            # Still return empty per-class accuracies for API consistency.
+            return {
+                'up_db': up,
+                'up_sil': up,
+                'up_kmeans': up,
+                'unknown_acc_db': {},
+                'unknown_acc_sil': {},
+                'unknown_acc_kmeans': {},
+                'unknown_acc_mean_db': 0.0,
+                'unknown_acc_mean_sil': 0.0,
+                'unknown_acc_mean_kmeans': 0.0,
+            }
     except Exception as e:
         logger.info(f"Stage 2 UP: u=1 check failed ({e}), proceeding to clustering.")
 
@@ -120,7 +142,17 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
             
         if not db_scores:
             logger.info("Stage 2 UP: Clustering failed (not enough samples/clusters).")
-            return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
+            return {
+                'up_db': 0.0,
+                'up_sil': 0.0,
+                'up_kmeans': 0.0,
+                'unknown_acc_db': {},
+                'unknown_acc_sil': {},
+                'unknown_acc_kmeans': {},
+                'unknown_acc_mean_db': 0.0,
+                'unknown_acc_mean_sil': 0.0,
+                'unknown_acc_mean_kmeans': 0.0,
+            }
 
         # Select k
         u_db = candidates[np.argmin(db_scores)]
@@ -128,6 +160,54 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
         
         logger.info(f"Stage 2 UP: Selected u_db={u_db} (DB Score), u_sil={u_sil} (Silhouette Score)")
         
+        def _majority_map_and_acc(true_labels, cluster_labels, num_known_local):
+            """Map each cluster -> unknown class by majority vote and compute per-unknown-class accuracy.
+
+            true_labels: shape [N], original labels in dataset space (>= num_known for unknown)
+            cluster_labels: shape [N], values in [0..K-1]
+            """
+            true_labels = np.asarray(true_labels)
+            cluster_labels = np.asarray(cluster_labels)
+
+            unknown_true = true_labels[true_labels >= num_known_local]
+            if unknown_true.size == 0:
+                return {}, 0.0
+
+            unknown_labels_local = sorted(set(unknown_true.tolist()))
+            if len(unknown_labels_local) == 0:
+                return {}, 0.0
+
+            # Build mapping cluster -> unknown_label (majority among unknown samples in that cluster)
+            cluster_to_label = {}
+            for c in np.unique(cluster_labels):
+                idx = (cluster_labels == c)
+                if np.sum(idx) == 0:
+                    continue
+                ys = true_labels[idx]
+                ys = ys[ys >= num_known_local]
+                if ys.size == 0:
+                    continue
+                vals, cnts = np.unique(ys, return_counts=True)
+                cluster_to_label[int(c)] = int(vals[np.argmax(cnts)])
+
+            # Predict unknown label for each sample
+            pred_unknown = np.full(true_labels.shape[0], fill_value=-1, dtype=int)
+            for i in range(true_labels.shape[0]):
+                cl = int(cluster_labels[i])
+                if cl in cluster_to_label:
+                    pred_unknown[i] = int(cluster_to_label[cl])
+
+            # Per unknown class accuracy
+            per_class_acc = {}
+            for u in unknown_labels_local:
+                mask_u = (true_labels == u)
+                tot_u = int(np.sum(mask_u))
+                cor_u = int(np.sum(pred_unknown[mask_u] == u))
+                per_class_acc[int(u)] = (float(cor_u) / float(tot_u)) if tot_u > 0 else 0.0
+
+            mean_acc = float(np.mean(list(per_class_acc.values()))) if len(per_class_acc) > 0 else 0.0
+            return per_class_acc, mean_acc
+
         def calculate_up_for_k(k_val):
             # Final clustering with selected u
             kmeans = KMeans(n_clusters=k_val, init='k-means++', random_state=51).fit(predict_unknown_X_scaled)
@@ -156,25 +236,49 @@ def compute_stage2_up(test_X, test_Y, label_hat, theta, num_known):
                             if np.argmax(confusion_mat_unknown[:, col]) == row:
                                 dominate_sample[col] = confusion_mat_unknown[row][col]
                                 
-            return np.sum(dominate_sample) / predict_unknown_X.shape[0]
+            up_val = np.sum(dominate_sample) / predict_unknown_X.shape[0]
 
-        up_db = calculate_up_for_k(u_db)
-        up_sil = calculate_up_for_k(u_sil)
+            # Unknown per-class classification accuracy (true unknown label -> predicted unknown label)
+            per_unknown_acc, mean_unknown_acc = _majority_map_and_acc(predict_unknown_Y, pred_label, num_known)
+            return up_val, per_unknown_acc, mean_unknown_acc
+
+        up_db, acc_db, acc_mean_db = calculate_up_for_k(u_db)
+        up_sil, acc_sil, acc_mean_sil = calculate_up_for_k(u_sil)
 
         # KMeans method: use k = num_unknown (fallback to 2), capped by sample count
-        n_samples = predict_unknown_X_scaled.shape[0]
+        n_samples2 = predict_unknown_X_scaled.shape[0]
         k_kmeans = num_unknown if num_unknown >= 2 else 2
-        k_kmeans = min(k_kmeans, max(2, n_samples))
-        if k_kmeans < 2 or n_samples < 2:
-            up_kmeans = 0.0
+        k_kmeans = min(k_kmeans, max(2, n_samples2))
+        if k_kmeans < 2 or n_samples2 < 2:
+            up_kmeans, acc_kmeans, acc_mean_kmeans = 0.0, {}, 0.0
         else:
-            up_kmeans = calculate_up_for_k(int(k_kmeans))
+            up_kmeans, acc_kmeans, acc_mean_kmeans = calculate_up_for_k(int(k_kmeans))
 
-        return {'up_db': up_db, 'up_sil': up_sil, 'up_kmeans': up_kmeans}
+        return {
+            'up_db': float(up_db),
+            'up_sil': float(up_sil),
+            'up_kmeans': float(up_kmeans),
+            'unknown_acc_db': acc_db,
+            'unknown_acc_sil': acc_sil,
+            'unknown_acc_kmeans': acc_kmeans,
+            'unknown_acc_mean_db': float(acc_mean_db),
+            'unknown_acc_mean_sil': float(acc_mean_sil),
+            'unknown_acc_mean_kmeans': float(acc_mean_kmeans),
+        }
 
     except Exception as e:
         logger.info(f"Stage 2 UP: Clustering logic failed ({e})")
-        return {'up_db': 0.0, 'up_sil': 0.0, 'up_kmeans': 0.0}
+        return {
+            'up_db': 0.0,
+            'up_sil': 0.0,
+            'up_kmeans': 0.0,
+            'unknown_acc_db': {},
+            'unknown_acc_sil': {},
+            'unknown_acc_kmeans': {},
+            'unknown_acc_mean_db': 0.0,
+            'unknown_acc_mean_sil': 0.0,
+            'unknown_acc_mean_kmeans': 0.0,
+        }
 
 def metrics_stage_1(true_label, predict_label, num_known):
     num_samples = predict_label.shape[0]
@@ -276,6 +380,25 @@ def evaluate_metric(test_Y, d_ct, theta, num_known, metric_name):
     logger.info(f"--- {metric_name} Results ---")
     logger.info(f"TKR: {tkr:.4f}, TUR: {tur:.4f}, KP: {kp:.4f}, FKR: {fkr:.4f}")
     logger.info(f"Mean Known Accuracy: {np.mean(accuracy):.4f}")
+
+    # Per-class accuracy (known + unknown)
+    # Known: accuracy list already contains per-class acc for [0..num_known-1]
+    try:
+        logger.info(f"Per-class Accuracy (Known, 0..{num_known-1}):")
+        for k in range(num_known):
+            ak = float(accuracy[k]) if k < len(accuracy) else -1.0
+            if ak < 0:
+                # class absent
+                logger.info(f"  Class {k}: N/A")
+            else:
+                logger.info(f"  Class {k}: {ak:.4f}")
+    except Exception:
+        pass
+
+    # Unknown per-class "correctly classified" accuracy is a Stage-2 concept
+    # (after clustering predicted-unknown samples). We'll log it where Stage-2
+    # is computed (see compute_stage2_up usage in evaluate_openset).
+
     # Return label_hat so callers can compute additional metrics (e.g. UP / predicted-unknown precision)
     return tkr, tur, kp, fkr, np.mean(accuracy), label_hat
 
@@ -584,6 +707,54 @@ def compute_prototype_distances(test_X, model, num_known):
     # 为了简化，这里先返回 None，在主流程里处理
     return d_ct
 
+def compute_probabilistic_distances(test_X, model, mapping_matrix):
+    """
+    计算样本到类别的"概率距离" (解决 One Class -> Many Prototypes 问题)。
+    逻辑:
+    1. 计算样本到所有 Prototypes 的相似度。
+    2. 利用 mapping_matrix (N_proto x N_class) 将相似度聚合到 Class 上。
+    3. Distance = 1 - ClassSimilarity
+    """
+    # 1. 获取 Prototypes 权重
+    # 兼容 DataParallel 和不同模型结构
+    if hasattr(model, 'module'):
+        proto_layer = model.module.prototypes
+    else:
+        proto_layer = model.prototypes
+
+    if isinstance(proto_layer, torch.nn.ModuleList) or hasattr(proto_layer, 'prototypes0'):
+         proto_weight = getattr(proto_layer, 'prototypes0').weight.data.cpu()
+    elif isinstance(proto_layer, torch.nn.Linear):
+         proto_weight = proto_layer.weight.data.cpu()
+    else:
+        return None
+
+    # 2. 归一化 (Embedding & Prototypes)
+    # SwAV 的核心是在单位球面上计算点积
+    test_X_norm = torch.nn.functional.normalize(test_X, p=2, dim=1)
+    proto_norm = torch.nn.functional.normalize(proto_weight, p=2, dim=1) # [N_proto, Dim]
+
+    # 3. 计算样本到所有 Prototypes 的相似度 (Proto Scores)
+    # [N_samples, N_proto]
+    proto_sim = torch.matmul(test_X_norm, proto_norm.t())
+    
+    # ReLU: 关键步骤！我们只关心正相关的原型，负相关的当做0处理，避免干扰
+    proto_sim = torch.nn.functional.relu(proto_sim)
+
+    # 4. 映射到类别 (Class Scores)
+    # mapping_matrix: [N_proto, N_class]
+    # class_sim: [N_samples, N_class]
+    # 这一步实现了加权求和：属于同一个 Class 的所有 Prototypes 的分数会加在一起
+    class_sim = torch.matmul(proto_sim, mapping_matrix)
+
+    # 5. 转换为距离
+    # 理论上 class_sim 最大可能超过 1 (如果样本同时像多个属于同一类的原型)
+    # 但为了兼容 OSR 阈值逻辑，我们限制在 [0, 1] 并转为距离
+    class_sim = torch.clamp(class_sim, 0.0, 1.0)
+    d_ct = 1.0 - class_sim.numpy()
+
+    return d_ct
+
 def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     logger.info("Starting Open Set Evaluation...")
     model.eval()
@@ -756,6 +927,26 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
             logger.info(f"Stage 2 UP (Euclidean) [KMeans]: {stage2_up_eu_kmeans:.4f}")
         else:
             logger.info("Stage 2 UP (Euclidean) [KMeans]: None")
+
+        # Unknown per-class classification accuracy (Stage-2)
+        try:
+            if res.get('unknown_acc_db'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Euclidean) [DB-majority]:")
+                for u in sorted(res['unknown_acc_db'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_db'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Euclidean) [DB-majority]: {res.get('unknown_acc_mean_db', 0.0):.4f}")
+            if res.get('unknown_acc_sil'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Euclidean) [Sil-majority]:")
+                for u in sorted(res['unknown_acc_sil'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_sil'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Euclidean) [Sil-majority]: {res.get('unknown_acc_mean_sil', 0.0):.4f}")
+            if res.get('unknown_acc_kmeans'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Euclidean) [KMeans-majority]:")
+                for u in sorted(res['unknown_acc_kmeans'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_kmeans'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Euclidean) [KMeans-majority]: {res.get('unknown_acc_mean_kmeans', 0.0):.4f}")
+        except Exception:
+            pass
     except Exception as e:
         logger.info(f"Stage 2 UP (Euclidean): failed ({e})")
 
@@ -791,6 +982,26 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
             logger.info(f"Stage 2 UP (Mahalanobis) [KMeans]: {stage2_up_mahal_kmeans:.4f}")
         else:
             logger.info("Stage 2 UP (Mahalanobis) [KMeans]: None")
+
+        # Unknown per-class classification accuracy (Stage-2)
+        try:
+            if res.get('unknown_acc_db'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Mahalanobis) [DB-majority]:")
+                for u in sorted(res['unknown_acc_db'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_db'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Mahalanobis) [DB-majority]: {res.get('unknown_acc_mean_db', 0.0):.4f}")
+            if res.get('unknown_acc_sil'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Mahalanobis) [Sil-majority]:")
+                for u in sorted(res['unknown_acc_sil'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_sil'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Mahalanobis) [Sil-majority]: {res.get('unknown_acc_mean_sil', 0.0):.4f}")
+            if res.get('unknown_acc_kmeans'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Mahalanobis) [KMeans-majority]:")
+                for u in sorted(res['unknown_acc_kmeans'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_kmeans'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Mahalanobis) [KMeans-majority]: {res.get('unknown_acc_mean_kmeans', 0.0):.4f}")
+        except Exception:
+            pass
     except Exception as e:
         logger.info(f"Stage 2 UP (Mahalanobis): failed ({e})")
 
@@ -845,6 +1056,26 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
         logger.info(f"Stage 2 UP (Consistency - Euclidean) [Silhouette]: {res['up_sil']:.4f}")
         if 'up_kmeans' in res:
              logger.info(f"Stage 2 UP (Consistency - Euclidean) [KMeans]: {res['up_kmeans']:.4f}")
+
+        # Unknown per-class classification accuracy (Stage-2)
+        try:
+            if res.get('unknown_acc_db'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Consistency - Euclidean) [DB-majority]:")
+                for u in sorted(res['unknown_acc_db'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_db'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Consistency - Euclidean) [DB-majority]: {res.get('unknown_acc_mean_db', 0.0):.4f}")
+            if res.get('unknown_acc_sil'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Consistency - Euclidean) [Sil-majority]:")
+                for u in sorted(res['unknown_acc_sil'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_sil'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Consistency - Euclidean) [Sil-majority]: {res.get('unknown_acc_mean_sil', 0.0):.4f}")
+            if res.get('unknown_acc_kmeans'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Consistency - Euclidean) [KMeans-majority]:")
+                for u in sorted(res['unknown_acc_kmeans'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_kmeans'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Consistency - Euclidean) [KMeans-majority]: {res.get('unknown_acc_mean_kmeans', 0.0):.4f}")
+        except Exception:
+            pass
     except Exception as e:
         logger.info(f"Stage 2 UP (Consistency): failed ({e})")
 
@@ -872,6 +1103,26 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
         logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [Silhouette]: {res['up_sil']:.4f}")
         if 'up_kmeans' in res:
              logger.info(f"Stage 2 UP (Consistency - Mahalanobis) [KMeans]: {res['up_kmeans']:.4f}")
+
+        # Unknown per-class classification accuracy (Stage-2)
+        try:
+            if res.get('unknown_acc_db'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Consistency - Mahalanobis) [DB-majority]:")
+                for u in sorted(res['unknown_acc_db'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_db'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Consistency - Mahalanobis) [DB-majority]: {res.get('unknown_acc_mean_db', 0.0):.4f}")
+            if res.get('unknown_acc_sil'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Consistency - Mahalanobis) [Sil-majority]:")
+                for u in sorted(res['unknown_acc_sil'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_sil'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Consistency - Mahalanobis) [Sil-majority]: {res.get('unknown_acc_mean_sil', 0.0):.4f}")
+            if res.get('unknown_acc_kmeans'):
+                logger.info("Stage 2 Unknown Per-class Accuracy (Consistency - Mahalanobis) [KMeans-majority]:")
+                for u in sorted(res['unknown_acc_kmeans'].keys()):
+                    logger.info(f"  Unknown Class {u}: {res['unknown_acc_kmeans'][u]:.4f}")
+                logger.info(f"Stage 2 Mean Unknown Acc (Consistency - Mahalanobis) [KMeans-majority]: {res.get('unknown_acc_mean_kmeans', 0.0):.4f}")
+        except Exception:
+            pass
     except Exception as e:
         logger.info(f"Stage 2 UP (Consistency 2): failed ({e})")
 
@@ -886,59 +1137,107 @@ def evaluate_openset(model, train_loader, test_loader, unknown_loader, args):
     'stage2_up_mahal_db': stage2_up_mahal_db if 'stage2_up_mahal_db' in locals() else None,
     'stage2_up_mahal_sil': stage2_up_mahal_sil if 'stage2_up_mahal_sil' in locals() else None,
     'stage2_up_mahal_kmeans': stage2_up_mahal_kmeans if 'stage2_up_mahal_kmeans' in locals() else None,
-        'stage2_up_cc_db': stage2_up_cc_db if 'stage2_up_cc_db' in locals() else None,
-        'stage2_up_cc_sil': stage2_up_cc_sil if 'stage2_up_cc_sil' in locals() else None,
-        'stage2_up_cc_kmeans': stage2_up_cc_kmeans if 'stage2_up_cc_kmeans' in locals() else None,
-        'stage2_up_cc_m_db': stage2_up_cc_m_db if 'stage2_up_cc_m_db' in locals() else None,
-        'stage2_up_cc_m_sil': stage2_up_cc_m_sil if 'stage2_up_cc_m_sil' in locals() else None,
-        'stage2_up_cc_m_kmeans': stage2_up_cc_m_kmeans if 'stage2_up_cc_m_kmeans' in locals() else None
+        # NOTE: consistency-check UP values are logged above but not necessarily
+        # stored as separate variables. Keep these keys for backward-compat,
+        # but default to None to avoid NameError/static analysis issues.
+        'stage2_up_cc_db': locals().get('stage2_up_cc_db', None),
+        'stage2_up_cc_sil': locals().get('stage2_up_cc_sil', None),
+        'stage2_up_cc_kmeans': locals().get('stage2_up_cc_kmeans', None),
+        'stage2_up_cc_m_db': locals().get('stage2_up_cc_m_db', None),
+        'stage2_up_cc_m_sil': locals().get('stage2_up_cc_m_sil', None),
+        'stage2_up_cc_m_kmeans': locals().get('stage2_up_cc_m_kmeans', None)
     }
     
-    # === 新增: Evaluate with SwAV Prototypes (Cosine) ===
-    logger.info("Evaluating with SwAV Prototypes (Cosine Distance)...")
+    # === Evaluate with Probabilistic Prototype Mapping (解决撞车问题的终极方案) ===
+    logger.info("Evaluating with Probabilistic Prototype Mapping...")
+
+    # --- A. 自动构建映射矩阵 W [N_proto, N_class] ---
+    # 1. 获取原型权重
+    if hasattr(model, 'module'):
+        proto_layer_ref = model.module.prototypes
+    else:
+        proto_layer_ref = model.prototypes
+        
+    if isinstance(proto_layer_ref, torch.nn.ModuleList) or hasattr(proto_layer_ref, 'prototypes0'):
+         proto_weight = getattr(proto_layer_ref, 'prototypes0').weight.data.cpu()
+    else:
+         proto_weight = proto_layer_ref.weight.data.cpu()
     
-    # 1. 计算 Train Set 的阈值 (Theta)
-    # 我们需要先算一遍训练集数据的距离，用来定阈值
-    d_train = compute_prototype_distances(train_X, model, num_known)
+    n_protos = proto_weight.shape[0]
+    # mapping_matrix[p, c] 表示 Prototype p 属于 Class c 的概率/权重
+    mapping_matrix = torch.zeros(n_protos, num_known)
+    
+    # 2. 跑一遍训练集，统计每个样本被分配给了哪个 Prototype
+    # 注意：这里我们使用 Projection Head 的特征 (Embedding)
+    train_X_norm = torch.nn.functional.normalize(train_X, p=2, dim=1)
+    proto_norm = torch.nn.functional.normalize(proto_weight, p=2, dim=1)
+    
+    # 计算每个训练样本最近的原型
+    # [N_train, N_proto]
+    sim = torch.matmul(train_X_norm, proto_norm.t())
+    assigned_protos = torch.argmax(sim, dim=1) # [N_train]
+    
+    # 3. 填充计数矩阵
+    for i in range(train_Y.shape[0]):
+        pid = assigned_protos[i].item()
+        cid = train_Y[i].item()
+        # 确保只处理已知类 (train_Y 理论上都是已知类，但为了保险)
+        if cid < num_known: 
+            mapping_matrix[pid, cid] += 1.0
+            
+    # 4. 归一化矩阵 (Row Normalization: P(Class | Proto))
+    # 每一行代表一个 Prototype，它的能量应该分配给哪些 Class
+    row_sums = mapping_matrix.sum(dim=1, keepdim=True)
+    # 避免除以 0 (如果有些死掉的原型没分到任何样本，就保持 0)
+    row_sums[row_sums == 0] = 1.0 
+    mapping_matrix = mapping_matrix / row_sums
+    
+    # (调试信息) 打印一下矩阵信息，确认是否解决了您遇到的 Class 0/18 撞车问题
+    # 如果 P39 同时服务于 C18 和 C0，这里会显示出来
+    if n_protos > 39 and num_known > 18:
+        if mapping_matrix[39, 18] > 0 and mapping_matrix[39, 0] > 0:
+            logger.info(f"✔ Collision Auto-Resolved: Proto 39 -> Class 18 ({mapping_matrix[39,18]:.2f}), Class 0 ({mapping_matrix[39,0]:.2f})")
+        else:
+            logger.info("Info: Proto 39 mapping check - No mixed assignment found or indices differ.")
+
+    # --- B. 计算距离并评估 ---
+    
+    # 1. 计算训练集距离 (用于定阈值 Theta)
+    # 注意：现在使用的是 mapping_matrix 计算出的加权距离
+    d_train = compute_probabilistic_distances(train_X, model, mapping_matrix)
+    
     if d_train is not None:
-        theta_proto = np.zeros(num_known)
+        theta_prob = np.zeros(num_known)
         for clas in range(num_known):
-            # 找到属于该类别的训练样本
             mask = (train_Y == clas).numpy()
             if mask.sum() > 0:
-                # 取出这些样本到"自己类原型"的距离
-                # d_train 是 [N, K]，我们取第 clas 列
+                # 取属于该类的样本，在该类上的距离
                 own_class_dist = d_train[mask, clas]
-                theta_proto[clas] = outlier_check(own_class_dist)
-        
-        # 2. 计算 Test Set 的距离
-        d_test = compute_prototype_distances(test_X, model, num_known)
-        
-        # 修正: d_test 的形状是 [N, K_prototypes]，而 num_known 是已知类数量
-        # 如果 K_prototypes > num_known (例如 54 > 18)，我们需要截断 d_test
-        # 假设前 num_known 个 prototypes 对应前 num_known 个类
-        if d_test.shape[1] > num_known:
-            d_test = d_test[:, :num_known]
+                theta_prob[clas] = outlier_check(own_class_dist)
+                
+        # 2. 计算测试集距离
+        d_test = compute_probabilistic_distances(test_X, model, mapping_matrix)
         
         # 3. 评估指标
+        # 这里的 evaluate_metric 会自动处理 Open Set 拒识逻辑
         tkr_p, tur_p, kp_p, fkr_p, mean_acc_p, label_hat_p = evaluate_metric(
-            test_Y, d_test, torch.tensor(theta_proto), num_known, "SwAV Prototype Cosine"
+            test_Y, d_test, torch.tensor(theta_prob), num_known, "SwAV Probabilistic"
         )
         
         # 4. (可选) 绘制直方图
         if hasattr(args, 'dump_path') and args.dump_path:
-             plot_distance_histogram(d_test, test_Y, num_known, "Prototype Cosine", args.dump_path)
+             plot_distance_histogram(d_test, test_Y, num_known, "Probabilistic Cosine", args.dump_path)
              
         # 5. (可选) 计算 Stage 2 UP 指标
-        logger.info("Computing Stage 2 UP (Prototype Cosine)...")
+        logger.info("Computing Stage 2 UP (Probabilistic)...")
         try:
-            # Pass test_Combined instead of test_X for clustering
-            res = compute_stage2_up(test_Combined, test_Y, label_hat_p, theta_proto, num_known)
-            logger.info(f"Stage 2 UP (Prototype Cosine) [DB]: {res['up_db']:.4f}")
-            logger.info(f"Stage 2 UP (Prototype Cosine) [Silhouette]: {res['up_sil']:.4f}")
+            # 依然使用 Enhanced Features (Combined) 进行聚类，但使用新的 label_hat 进行筛选
+            res = compute_stage2_up(test_Combined, test_Y, label_hat_p, theta_prob, num_known)
+            logger.info(f"Stage 2 UP (Probabilistic) [DB]: {res['up_db']:.4f}")
+            logger.info(f"Stage 2 UP (Probabilistic) [Silhouette]: {res['up_sil']:.4f}")
             if 'up_kmeans' in res:
-                logger.info(f"Stage 2 UP (Prototype Cosine) [KMeans]: {res['up_kmeans']:.4f}")
+                logger.info(f"Stage 2 UP (Probabilistic) [KMeans]: {res['up_kmeans']:.4f}")
         except Exception as e:
-            logger.info(f"Stage 2 UP (Prototype Cosine): failed ({e})")
+            logger.info(f"Stage 2 UP (Probabilistic): failed ({e})")
     
     return results
