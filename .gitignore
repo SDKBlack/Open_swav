@@ -1,6 +1,8 @@
+
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
 *.pyd
 *.swp
 
@@ -15,30 +17,34 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Virtual environments
+# env
 .env
 .venv/
 venv/
 
-# Caches & tooling
+# build
+dist/
+build/
+
+# Caches
 .cache/
 .mypy_cache/
 .pytest_cache/
-dist/
-build/
 
 # Logs / temp
 *.log
 logs/
 tmp/
 
-# Data / datasets / large artifacts (不要把数据和大 checkpoint 推上 GitHub)
+# Data / datasets / large files (不要把数据和大 checkpoint 推上 github)
 Data/
 **/Data/
-checkpoints/
-**/checkpoints/
+S3R/Data/
 dump*/
 **/dump*/
+test_*/
+checkpoints/
+**/checkpoints/
 
 # Model / array artifacts
 *.pth
@@ -56,7 +62,16 @@ dump*/
 *.tfrecord
 *.lmdb
 
+# large folders created by runs / autoDL
+.autodl/
+
 # Experiment output folders in this repo
-swav/test*/
+swav/test*
+swav/test_wtnet/
+swav/test_pro45/
+swav/test/
 autodl-tmp/test_*/
 autodl-tmp/swav/test*/
+
+# Optional external code folder (keep out of this repo)
+WTConv-main/
