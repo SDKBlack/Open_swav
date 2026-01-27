@@ -1,0 +1,77 @@
+INFO - 01/05/26 21:25:14 - 0:00:00 - ============ Initialized logger ============
+INFO - 01/05/26 21:25:14 - 0:00:00 - arch: wtnet
+                                     aux_loss_weight: 1.0
+                                     base_lr: 0.1
+                                     batch_size: 128
+                                     boundary_loss_weight: 0.1
+                                     boundary_neg_thresh: 1.0
+                                     boundary_pos_anneal_epochs: 0
+                                     boundary_pos_start: None
+                                     boundary_pos_thresh: 0.5
+                                     boundary_proto_thresh: 1.0
+                                     boundary_warmup_epochs: 0
+                                     checkpoint_freq: 25
+                                     crops_for_assign: [0, 1]
+                                     data_path: /root/autodl-tmp/S3R
+                                     dist_url: env://
+                                     dump_checkpoints: ./checkpoints
+                                     dump_path: .
+                                     epoch_queue_starts: 15
+                                     epochs: 200
+                                     epsilon: 0.05
+                                     feat_dim: 128
+                                     final_lr: 0.001
+                                     freeze_prototypes_niters: 313
+                                     gpu_to_work_on: 0
+                                     hidden_mlp: 2048
+                                     is_slurm_job: False
+                                     local_rank: 0
+                                     max_scale_crops: [1]
+                                     min_scale_crops: [0.14]
+                                     mixup_loss_weight: 1
+                                     n_active_prototypes: 0
+                                     nmb_crops: [6]
+                                     nmb_prototypes: 36
+                                     num_classes: 0
+                                     pooling_type: gem
+                                     queue_length: 8096
+                                     rank: 1
+                                     seed: 31
+                                     shared_stem_blocks: 2
+                                     sinkhorn_iterations: 3
+                                     size_crops: [224]
+                                     spec_freq_masks: 2
+                                     spec_max_freq: 30
+                                     spec_max_time: 40
+                                     spec_time_masks: 2
+                                     split_path: /root/autodl-tmp/S3R/experiment_groups/1-known_for_train
+                                     start_warmup: 0
+                                     swav_weight: 0.5
+                                     sync_bn: pytorch
+                                     syncbn_process_group_size: 8
+                                     tb_log_interval: 50
+                                     temperature: 0.1
+                                     test_split_path: /root/autodl-tmp/S3R/experiment_groups/1-known_for_test
+                                     unknown_split_path: /root/autodl-tmp/S3R/experiment_groups/1-unknown
+                                     use_aux_heads: False
+                                     use_boundary_loss: False
+                                     use_fp16: True
+                                     use_freq_pos_enc: False
+                                     use_mixup: False
+                                     use_shared_stem: False
+                                     use_sk_fusion: False
+                                     use_specaugment: False
+                                     warmup_epochs: 10
+                                     wd: 1e-06
+                                     workers: 10
+                                     world_size: 2
+INFO - 01/05/26 21:25:14 - 0:00:00 - The experiment will be stored in .
+                                     
+
+INFO - 01/05/26 21:25:14 - 0:00:00 - TensorBoard writer not created on this rank or SummaryWriter unavailable
+INFO - 01/05/26 21:25:14 - 0:00:00 - Automatically detected number of classes: 18
+INFO - 01/05/26 21:25:14 - 0:00:00 - Building data done with 8294 images loaded.
+INFO - 01/05/26 21:25:14 - 0:00:00 - Building model done.
+WARNING - 01/05/26 21:25:14 - 0:00:00 - NVIDIA Apex LARC not found. Training without LARC.
+INFO - 01/05/26 21:25:14 - 0:00:00 - Building optimizer done.
+INFO - 01/05/26 21:25:14 - 0:00:00 - Initializing mixed precision done.

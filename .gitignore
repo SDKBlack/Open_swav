@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.env
+.venv/
+venv/
+
+# Caches & tooling
+.cache/
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+
+# Logs / temp
+*.log
+logs/
+tmp/
+
+# Data / datasets / large artifacts (不要把数据和大 checkpoint 推上 GitHub)
+Data/
+**/Data/
+checkpoints/
+**/checkpoints/
+dump*/
+**/dump*/
+
+# Model / array artifacts
+*.pth
+*.pt
+*.ckpt
+*.ckp
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.tar
+*.tar.gz
+*.zip
+*.tfrecord
+*.lmdb
+
+# Experiment output folders in this repo
+swav/test*/
+autodl-tmp/test_*/
+autodl-tmp/swav/test*/
