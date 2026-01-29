@@ -73,5 +73,29 @@ swav/test/
 autodl-tmp/test_*/
 autodl-tmp/swav/test*/
 
+# ---- Keep selected experiment artifacts, but NOT checkpoints/weights ----
+# 只上传这三个 test 目录里的日志/图片/小型统计文件；权重与队列仍不上传。
+!autodl-tmp/swav/test_resnet+boundary_bn/
+!autodl-tmp/swav/test_resnet+boundary_bn/**
+!autodl-tmp/swav/test_resnet+boundary+swav_bn/
+!autodl-tmp/swav/test_resnet+boundary+swav_bn/**
+!autodl-tmp/swav/test_resnet+swav_bn/
+!autodl-tmp/swav/test_resnet+swav_bn/**
+
+# Re-ignore weights inside the allowed folders
+autodl-tmp/swav/test_resnet+boundary_bn/**/*.pth
+autodl-tmp/swav/test_resnet+boundary_bn/**/*.pth.tar
+autodl-tmp/swav/test_resnet+boundary_bn/**/checkpoint*.pth.tar
+
+autodl-tmp/swav/test_resnet+boundary+swav_bn/**/*.pth
+autodl-tmp/swav/test_resnet+boundary+swav_bn/**/*.pth.tar
+autodl-tmp/swav/test_resnet+boundary+swav_bn/**/checkpoint*.pth.tar
+autodl-tmp/swav/test_resnet+boundary+swav_bn/**/queue*.pth
+
+autodl-tmp/swav/test_resnet+swav_bn/**/*.pth
+autodl-tmp/swav/test_resnet+swav_bn/**/*.pth.tar
+autodl-tmp/swav/test_resnet+swav_bn/**/checkpoint*.pth.tar
+autodl-tmp/swav/test_resnet+swav_bn/**/queue*.pth
+
 # Optional external code folder (keep out of this repo)
 WTConv-main/

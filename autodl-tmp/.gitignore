@@ -42,6 +42,41 @@ swav/test_wtnet/
 swav/test_pro45/
 swav/test/
 
+# ---- Keep selected experiment artifacts, but NOT checkpoints/weights ----
+# 允许上传这三个实验目录里的 README / .gitkeep；权重仍由 *.pth / *.tar 等规则忽略。
+!swav/test_resnet+boundary_bn/
+!swav/test_resnet+boundary_bn/**
+!swav/test_resnet+boundary+swav_bn/
+!swav/test_resnet+boundary+swav_bn/**
+!swav/test_resnet+swav_bn/
+!swav/test_resnet+swav_bn/**
+
+# Keep directory structure without committing weights
+!swav/test_resnet+boundary_bn/checkpoints/
+!swav/test_resnet+boundary_bn/checkpoints/.gitkeep
+!swav/test_resnet+boundary+swav_bn/checkpoints/
+!swav/test_resnet+boundary+swav_bn/checkpoints/.gitkeep
+!swav/test_resnet+swav_bn/checkpoints/
+!swav/test_resnet+swav_bn/checkpoints/.gitkeep
+
+# Re-ignore weights/checkpoints inside the allowed folders
+swav/test_resnet+boundary_bn/**/*.pth
+swav/test_resnet+boundary_bn/**/*.pth.tar
+swav/test_resnet+boundary_bn/**/checkpoint*.pth.tar
+swav/test_resnet+boundary_bn/checkpoints/*.pth
+
+swav/test_resnet+boundary+swav_bn/**/*.pth
+swav/test_resnet+boundary+swav_bn/**/*.pth.tar
+swav/test_resnet+boundary+swav_bn/**/checkpoint*.pth.tar
+swav/test_resnet+boundary+swav_bn/**/queue*.pth
+swav/test_resnet+boundary+swav_bn/checkpoints/*.pth
+
+swav/test_resnet+swav_bn/**/*.pth
+swav/test_resnet+swav_bn/**/*.pth.tar
+swav/test_resnet+swav_bn/**/checkpoint*.pth.tar
+swav/test_resnet+swav_bn/**/queue*.pth
+swav/test_resnet+swav_bn/checkpoints/*.pth
+
 # env
 .env
 .venv/
